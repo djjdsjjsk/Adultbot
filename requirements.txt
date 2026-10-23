@@ -1,4 +1,1 @@
-pyrogram
-tgcrypto
-pymongo
-flask
+pyTelegramBotAPI==4.29.1
