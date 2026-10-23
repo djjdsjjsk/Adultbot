@@ -19,9 +19,9 @@ from telebot import types
 # PUBLIC_BASE_URL is not required; Telegram deep links are used.
 # ============================================================
 
-BOT_TOKEN = os.getenv("8822909409:AAGm0buchw5lbqPPIj5QIPo9viXOIY_i-5o", "").strip()
-ADMIN_ID_RAW = os.getenv("5989928539", "").strip()
-CHANNEL_ID_RAW = os.getenv("-1004484156741", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/var/data/files.db").strip()
 
 if not BOT_TOKEN:
