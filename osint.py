@@ -1,437 +1,426 @@
 import os
-import re
 import time
-import uuid
 import sqlite3
+import threading
 import logging
-from pathlib import Path
-from threading import Lock
-
+import random
+import requests
 import telebot
-from telebot import types
 
-# ============================================================
-# TELEGRAM FILE STORE BOT - Render + SQLite
-# Required environment variables:
-# BOT_TOKEN, ADMIN_ID, CHANNEL_ID
-# Optional:
-# DATABASE_PATH (default /var/data/files.db)
-# PUBLIC_BASE_URL is not required; Telegram deep links are used.
-# ============================================================
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from requests.adapters import HTTPAdapter
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()
-DATABASE_PATH = os.getenv("DATABASE_PATH", "/var/data/files.db").strip()
+# ============ CONFIGURATION ============
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = 5989928539
+APP_URL = os.environ.get("APP_URL", "https://osint-s7db.onrender.com").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
 
-if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN environment variable.")
-if not ADMIN_ID_RAW:
-    raise RuntimeError("Missing ADMIN_ID environment variable.")
-if not CHANNEL_ID_RAW:
-    raise RuntimeError("Missing CHANNEL_ID environment variable.")
+POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "👏", "🎉", "🤩", "💯"]
 
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-    CHANNEL_ID = int(CHANNEL_ID_RAW)
-except ValueError as exc:
-    raise RuntimeError("ADMIN_ID and CHANNEL_ID must be numeric IDs.") from exc
-
-# Make sure the database folder exists. On Render, mount a persistent disk
-# at /var/data. For local testing, set DATABASE_PATH=files.db.
-db_parent = Path(DATABASE_PATH).expanduser().resolve().parent
-db_parent.mkdir(parents=True, exist_ok=True)
+if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
+    raise RuntimeError(
+        "BOT_TOKEN missing. Render Dashboard > Environment mein BOT_TOKEN set karein."
+    )
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("telegram-file-store")
+logger = logging.getLogger("telegram-bot")
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True)
-db_lock = Lock()
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=4)
 
-# Temporary upload queue: user_id -> source message_id and metadata.
-# If the process restarts before Upload Now is clicked, ask the user to resend.
-pending_uploads = {}
+# Temporary memory to handle multi-step broadcast for admin
+broadcast_states = {}
 
 
-def db_connect():
-    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+# ============ DATABASE HELPERS ============
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
 def init_db():
-    with db_lock:
-        with db_connect() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS stored_files (
-                    token TEXT PRIMARY KEY,
-                    channel_id INTEGER NOT NULL,
-                    channel_message_id INTEGER NOT NULL,
-                    owner_user_id INTEGER NOT NULL,
-                    owner_name TEXT,
-                    original_message_id INTEGER,
-                    file_name TEXT,
-                    media_type TEXT,
-                    created_at INTEGER NOT NULL,
-                    downloads INTEGER NOT NULL DEFAULT 0
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_stored_files_created
-                ON stored_files(created_at)
-            """)
-            conn.commit()
+    conn = get_db()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logged_messages (
+                content_hash TEXT PRIMARY KEY
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_spam (
+                user_id INTEGER PRIMARY KEY,
+                last_msg_hash TEXT,
+                count INTEGER DEFAULT 1,
+                mute_until REAL DEFAULT 0
+            )
+        """)
+        conn.commit()
+        logger.info("Database initialized successfully: %s", DB_PATH)
+    finally:
+        conn.close()
 
 
-def html_escape(value):
-    value = str(value or "")
-    return (value.replace("&", "&amp;")
-                 .replace("<", "&lt;")
-                 .replace(">", "&gt;")
-                 .replace('"', "&quot;"))
+def add_user(user_id, first_name):
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO users (user_id, first_name, status)
+            VALUES (?, ?, 'active')
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = excluded.first_name,
+                status = 'active'
+        """, (user_id, first_name))
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def get_media_info(message):
-    """Return (media_type, best-effort filename) for supported Telegram media."""
-    if message.document:
-        return "document", message.document.file_name or "document"
-    if message.video:
-        return "video", message.video.file_name or "video"
-    if message.audio:
-        return "audio", message.audio.file_name or message.audio.title or "audio"
-    if message.animation:
-        return "animation", message.animation.file_name or "animation"
-    if message.voice:
-        return "voice", "voice message"
-    if message.video_note:
-        return "video_note", "video note"
-    if message.sticker:
-        return "sticker", message.sticker.emoji or "sticker"
-    if message.photo:
-        return "photo", "photo"
-    if message.contact:
-        return "contact", "contact"
-    if message.location:
-        return "location", "location"
-    if message.venue:
-        return "venue", message.venue.title or "venue"
-    return None, None
+def get_all_users():
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT user_id FROM users WHERE status = 'active'").fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
 
 
-def make_upload_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(
-        "⬆️ Upload Now",
-        callback_data="upload_now"
-    ))
-    return keyboard
+def is_message_logged(content_hash):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM logged_messages WHERE content_hash = ?", (content_hash,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 
-def get_bot_link(token):
-    username = bot.get_me().username
-    return f"https://t.me/{username}?start={token}"
+def log_message_hash(content_hash):
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO logged_messages (content_hash) VALUES (?)",
+            (content_hash,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
-def get_saved_file(token):
-    with db_connect() as conn:
-        return conn.execute(
-            "SELECT * FROM stored_files WHERE token = ?",
-            (token,)
+def check_and_update_spam(user_id, content_hash):
+    conn = get_db()
+    now = time.time()
+    try:
+        row = conn.execute(
+            "SELECT last_msg_hash, count, mute_until FROM user_spam WHERE user_id = ?",
+            (user_id,)
         ).fetchone()
 
+        if row:
+            last_hash, count, mute_until = row
+            if now < mute_until:
+                return "muted"
 
-def save_file_record(token, channel_message_id, owner_id, owner_name,
-                     original_message_id, file_name, media_type):
-    with db_lock:
-        with db_connect() as conn:
-            conn.execute("""
-                INSERT INTO stored_files (
-                    token, channel_id, channel_message_id, owner_user_id,
-                    owner_name, original_message_id, file_name, media_type,
-                    created_at, downloads
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """, (
-                token, CHANNEL_ID, channel_message_id, owner_id, owner_name,
-                original_message_id, file_name, media_type, int(time.time())
-            ))
-            conn.commit()
+            if last_hash == content_hash:
+                count += 1
+            else:
+                count = 1
+                last_hash = content_hash
 
-
-def increment_downloads(token):
-    with db_lock:
-        with db_connect() as conn:
-            conn.execute(
-                "UPDATE stored_files SET downloads = downloads + 1 WHERE token = ?",
-                (token,)
-            )
-            conn.commit()
-
-
-@bot.message_handler(commands=["start"])
-def start_handler(message):
-    args = (message.text or "").split(maxsplit=1)
-    payload = args[1].strip() if len(args) > 1 else ""
-
-    if payload:
-        # Tokens are generated by this bot and contain only safe characters.
-        if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", payload):
-            bot.reply_to(message, "❌ This share link is invalid.")
-            return
-
-        record = get_saved_file(payload)
-        if not record:
-            bot.reply_to(
-                message,
-                "❌ <b>File not found</b>\nThis link may be invalid or the file is no longer registered."
-            )
-            return
-
-        try:
-            # Copy the original channel post, preserving its media/caption as
-            # Telegram stores it. No download/re-upload conversion is done.
-            bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=record["channel_id"],
-                message_id=record["channel_message_id"]
-            )
-            increment_downloads(payload)
-            logger.info("Delivered token=%s to user_id=%s", payload, message.from_user.id)
-        except telebot.apihelper.ApiTelegramException:
-            logger.exception("Could not copy channel message for token=%s", payload)
-            bot.send_message(
-                message.chat.id,
-                "⚠️ I couldn't send this file right now. Please contact the bot admin."
-            )
-        except Exception:
-            logger.exception("Unexpected delivery error for token=%s", payload)
-            bot.send_message(
-                message.chat.id,
-                "⚠️ Delivery failed temporarily. Please try again later."
-            )
-        return
-
-    bot.reply_to(
-        message,
-        "📁 <b>Welcome to File Store Bot</b>\n\n"
-        "Send me a file, photo, video, audio, sticker, or another supported "
-        "Telegram media message.\n\n"
-        "Then tap <b>⬆️ Upload Now</b> to save it and receive a shareable link."
-    )
-
-
-@bot.message_handler(commands=["id"])
-def id_handler(message):
-    """Useful for setup: returns the user's ID and current chat ID."""
-    bot.reply_to(
-        message,
-        f"Your user ID: <code>{message.from_user.id}</code>\n"
-        f"Current chat ID: <code>{message.chat.id}</code>"
-    )
-
-
-@bot.message_handler(content_types=[
-    "document", "photo", "video", "audio", "voice",
-    "animation", "sticker", "video_note", "contact",
-    "location", "venue"
-])
-def media_handler(message):
-    media_type, file_name = get_media_info(message)
-    if not media_type:
-        bot.reply_to(message, "⚠️ I couldn't identify that media. Please try another file.")
-        return
-
-    pending_uploads[message.from_user.id] = {
-        "chat_id": message.chat.id,
-        "message_id": message.message_id,
-        "file_name": file_name,
-        "media_type": media_type,
-        "created_at": time.time(),
-        "busy": False,
-    }
-
-    bot.reply_to(
-        message,
-        "📄 <b>File received</b>\n"
-        f"🏷 <b>Name:</b> {html_escape(file_name)}\n"
-        f"📦 <b>Type:</b> {html_escape(media_type)}\n\n"
-        "Tap below to save it to the private channel.",
-        reply_markup=make_upload_keyboard()
-    )
-
-
-@bot.callback_query_handler(func=lambda call: call.data == "upload_now")
-def upload_now_handler(call):
-    user_id = call.from_user.id
-    pending = pending_uploads.get(user_id)
-
-    if not pending:
-        bot.answer_callback_query(
-            call.id,
-            "No pending file found. Please send the file again.",
-            show_alert=True
-        )
-        return
-
-    if pending.get("busy"):
-        bot.answer_callback_query(call.id, "Your file is already being saved.")
-        return
-
-    # Ignore stale pending uploads after 2 hours.
-    if time.time() - pending.get("created_at", 0) > 7200:
-        pending_uploads.pop(user_id, None)
-        bot.answer_callback_query(
-            call.id,
-            "This upload expired. Please send the file again.",
-            show_alert=True
-        )
-        return
-
-    pending["busy"] = True
-    bot.answer_callback_query(call.id, "Saving your file…")
-
-    user = call.from_user
-    owner_name = " ".join(
-        part for part in [user.first_name, user.last_name] if part
-    ).strip() or user.username or str(user_id)
-
-    token = uuid.uuid4().hex[:16]
-
-    try:
-        # Copy from the user's chat to the configured private channel.
-        # This preserves the Telegram media and its original caption.
-        copied = bot.copy_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=pending["chat_id"],
-            message_id=pending["message_id"]
-        )
-
-        channel_message_id = copied.message_id
-        save_file_record(
-            token=token,
-            channel_message_id=channel_message_id,
-            owner_id=user_id,
-            owner_name=owner_name,
-            original_message_id=pending["message_id"],
-            file_name=pending["file_name"],
-            media_type=pending["media_type"]
-        )
-
-        link = get_bot_link(token)
-
-        # Add a separate reply-tag in the private channel so the original
-        # copied media remains unchanged while its share link is easy to find.
-        try:
-            bot.send_message(
-                CHANNEL_ID,
-                "🏷 <b>FILE STORE RECORD</b>\n"
-                f"📄 <b>File:</b> {html_escape(pending['file_name'])}\n"
-                f"📦 <b>Type:</b> {html_escape(pending['media_type'])}\n"
-                f"🆔 <b>File ID:</b> <code>{token}</code>\n"
-                f"👤 <b>Uploaded by:</b> {html_escape(owner_name)} "
-                f"(<code>{user_id}</code>)\n"
-                f"🔗 <b>Share link:</b> {html_escape(link)}",
-                reply_to_message_id=channel_message_id,
-                disable_web_page_preview=True
-            )
-        except Exception:
-            logger.exception("Could not add the file tag reply in the private channel")
-
-        bot.send_message(
-            pending["chat_id"],
-            "✅ <b>File saved successfully!</b>\n\n"
-            f"🏷 <b>File:</b> {html_escape(pending['file_name'])}\n"
-            f"🆔 <b>File ID:</b> <code>{token}</code>\n\n"
-            "🔗 <b>Shareable link:</b>\n"
-            f"<code>{html_escape(link)}</code>\n\n"
-            "Anyone with this link can open the bot and receive this file.",
-            reply_to_message_id=pending["message_id"],
-            disable_web_page_preview=True
-        )
-
-        # Add a labelled record in the admin chat for easy identification.
-        # The actual stored media is the post in the private channel.
-        if ADMIN_ID != user_id:
-            try:
-                bot.send_message(
-                    ADMIN_ID,
-                    "🗂 <b>New file stored</b>\n"
-                    f"🏷 <b>Name:</b> {html_escape(pending['file_name'])}\n"
-                    f"📦 <b>Type:</b> {html_escape(pending['media_type'])}\n"
-                    f"👤 <b>Uploader:</b> {html_escape(owner_name)}\n"
-                    f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
-                    f"🆔 <b>File ID:</b> <code>{token}</code>\n"
-                    f"📌 <b>Channel message ID:</b> <code>{channel_message_id}</code>\n"
-                    f"🔗 {html_escape(link)}",
-                    disable_web_page_preview=True
+            if count >= 4:
+                mute_until = now + 900
+                conn.execute(
+                    "UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = ? WHERE user_id = ?",
+                    (last_hash, count, mute_until, user_id)
                 )
-            except Exception:
-                logger.exception("Could not send admin notification")
-
-        pending_uploads.pop(user_id, None)
-
-        # Update the button message to show completion.
-        try:
-            bot.edit_message_text(
-                "✅ <b>Upload complete.</b> Your shareable link has been sent above.",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id
+                conn.commit()
+                return "just_muted"
+            else:
+                conn.execute(
+                    "UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = 0 WHERE user_id = ?",
+                    (last_hash, count, user_id)
+                )
+                conn.commit()
+                return "active"
+        else:
+            conn.execute(
+                "INSERT INTO user_spam (user_id, last_msg_hash, count, mute_until) VALUES (?, ?, 1, 0)",
+                (user_id, content_hash)
             )
+            conn.commit()
+            return "active"
+    finally:
+        conn.close()
+
+
+def get_user_mute_status(user_id):
+    conn = get_db()
+    now = time.time()
+    try:
+        row = conn.execute(
+            "SELECT mute_until FROM user_spam WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row and row[0] > now:
+            return int(row[0] - now)
+        return 0
+    finally:
+        conn.close()
+
+
+# ============ HEALTH-CHECK WEB SERVER ============
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        body = b"Bot service is running"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def start_health_server():
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+        server.daemon_threads = True
+        logger.info("Health server listening on port %s", PORT)
+        server.serve_forever()
+    except Exception:
+        logger.exception("Health server failed to start")
+
+
+# ============ SELF-PING EVERY 3 MINUTES ============
+def start_self_ping():
+    session = requests.Session()
+    try:
+        from urllib3.util.retry import Retry
+        retry = Retry(
+            total=2, connect=2, read=2, backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"]
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retry))
+    except Exception:
+        pass
+
+    def worker():
+        time.sleep(20)
+        while True:
+            try:
+                response = session.get(APP_URL + "/health", timeout=15)
+                logger.info("Self-ping: HTTP %s", response.status_code)
+                response.close()
+            except requests.RequestException:
+                logger.exception("Self-ping failed")
+            time.sleep(180)
+
+    threading.Thread(target=worker, daemon=True, name="self-ping").start()
+
+
+# ============ AUTO REACTIONS & MESSAGE FILTERING ============
+@bot.channel_post_handler(func=lambda message: True)
+@bot.message_handler(func=lambda message: message.chat.type in ["group", "supergroup"] and (not message.text or not message.text.startswith("/")))
+def handle_reactions_and_filtering(message):
+    try:
+        chat_id = message.chat.id
+        message_id = message.id
+        user_id = message.from_user.id if message.from_user else None
+
+        # 1. Auto Positive Reaction
+        try:
+            chosen_reaction = random.choice(POSITIVE_REACTIONS)
+            bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[telebot.types.ReactionTypeEmoji(chosen_reaction)])
         except Exception:
             pass
 
-    except telebot.apihelper.ApiTelegramException as exc:
-        logger.exception("Telegram API error while saving file")
-        pending_uploads[user_id]["busy"] = False
-        bot.send_message(
-            pending["chat_id"],
-            "❌ <b>Upload failed.</b>\n"
-            "Check that the bot is an administrator in your private channel "
-            "and has permission to post messages.\n\n"
-            "Please try Upload Now again after fixing the channel settings."
+        # 2. Delete Service Messages (Join/Leave)
+        if message.content_type in ["new_chat_members", "left_chat_member", "group_chat_created", "migrate_to_chat_id"]:
+            try:
+                bot.delete_message(chat_id, message_id)
+            except Exception:
+                pass
+            return
+
+        # 3. Check Mute Status
+        if user_id and user_id != ADMIN_ID:
+            remaining_time = get_user_mute_status(user_id)
+            if remaining_time > 0:
+                try:
+                    bot.delete_message(chat_id, message_id)
+                except Exception:
+                    pass
+                return
+
+        # 4. URL, t.me & Username Filter
+        if message.text:
+            text_lower = message.text.lower()
+            has_url = "http://" in text_lower or "https://" in text_lower or "www." in text_lower or "t.me/" in text_lower or ("@" in text_lower and not message.text.startswith("/"))
+            
+            if has_url and user_id != ADMIN_ID:
+                try:
+                    bot.delete_message(chat_id, message_id)
+                    return
+                except Exception:
+                    pass
+
+            # 5. Logged / Duplicate Message Filter
+            content_hash = f"{chat_id}_{text_lower.strip()}"
+            if is_message_logged(content_hash) and user_id != ADMIN_ID:
+                spam_status = check_and_update_spam(user_id, content_hash)
+                try:
+                    bot.delete_message(chat_id, message_id)
+                    if spam_status == "just_muted":
+                        bot.send_message(chat_id, f"⚠️ {message.from_user.first_name}, you have been muted for 15 minutes due to spamming.")
+                except Exception:
+                    pass
+                return
+
+    except Exception:
+        logger.exception("Error in filter handler")
+
+
+# ============ MANUAL MESSAGE LOGGING (/log) ============
+@bot.message_handler(commands=["log"])
+def log_custom_message(message):
+    try:
+        if message.from_user.id != ADMIN_ID:
+            return
+        if not message.reply_to_message:
+            bot.reply_to(message, "⚠️ Reply to any message with /log to blacklist it.")
+            return
+
+        replied_msg = message.reply_to_message
+        if replied_msg.text:
+            content_hash = f"{replied_msg.chat.id}_{replied_msg.text.lower().strip()}"
+            log_message_hash(content_hash)
+            bot.reply_to(message, "✅ Message logged successfully! Future instances will be auto-deleted.")
+        else:
+            bot.reply_to(message, "⚠️ Only text messages can be logged.")
+    except Exception:
+        logger.exception("Log command failed")
+
+
+# ============ ADMIN BROADCAST SYSTEM ============
+@bot.message_handler(commands=["broadcast"])
+def broadcast_command(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    broadcast_states[ADMIN_ID] = True
+    bot.reply_to(message, "📢 **Broadcast Mode Activated!**\n\nAb aap jo bhi bhejenge (Video, Photo, Audio, Document, Text - sath me Link ya Button ke sath), woh sare users ko broadcast kar diya jayega.\n\nCancel karne ke liye `/cancel` bhejein.")
+
+
+@bot.message_handler(commands=["cancel"])
+def cancel_broadcast(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if ADMIN_ID in broadcast_states:
+        del broadcast_states[ADMIN_ID]
+        bot.reply_to(message, "❌ Broadcast mode cancelled.")
+    else:
+        bot.reply_to(message, "⚠️ No active broadcast process.")
+
+
+@bot.message_handler(func=lambda msg: msg.from_user.id == ADMIN_ID and broadcast_states.get(ADMIN_ID, False), content_types=["text", "photo", "video", "audio", "document", "animation", "voice"])
+def execute_broadcast(message):
+    if message.text and message.text.startswith("/cancel"):
+        return
+
+    # Clear broadcast state immediately
+    broadcast_states.pop(ADMIN_ID, None)
+    
+    users = get_all_users()
+    success = 0
+    failed = 0
+
+    status_msg = bot.reply_to(message, f"🚀 Broadcast started to {len(users)} users...")
+
+    for uid in users:
+        try:
+            # Forward or copy any media/text type with its buttons/links intact
+            bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.id)
+            success += 1
+            time.sleep(0.05) # Prevent flood limits
+        except Exception:
+            failed += 1
+
+    try:
+        bot.edit_message_text(
+            f"✅ **Broadcast Completed!**\n\n• Successful: {success}\n• Failed: {failed}",
+            chat_id=message.chat.id,
+            message_id=status_msg.id,
+            parse_mode="Markdown"
         )
     except Exception:
-        logger.exception("Unexpected error while saving file")
-        pending_uploads[user_id]["busy"] = False
-        bot.send_message(
-            pending["chat_id"],
-            "❌ Something went wrong while saving the file. Please try again."
-        )
+        pass
 
 
-@bot.message_handler(func=lambda message: True, content_types=["text"])
-def text_fallback(message):
-    if (message.text or "").startswith("/"):
-        bot.reply_to(message, "Use /start to see how to upload and share files.")
-    else:
-        bot.reply_to(
-            message,
-            "📁 Please send a file or media message, then tap <b>⬆️ Upload Now</b>."
-        )
+# ============ START COMMAND WITH ADMIN PANEL ============
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    try:
+        user_id = message.from_user.id
+        first_name = message.from_user.first_name or "User"
+        add_user(user_id, first_name)
+
+        if user_id == ADMIN_ID:
+            text = (
+                "👑 **Admin Control Panel**\n\n"
+                "• /broadcast - Saare users ko Media/Video/Audio/Link broadcast karein\n"
+                "• Reply message + `/log` - Kisi message ko blacklist/auto-delete karne ke liye\n"
+                "• Bot active hai aur saare security/reaction features background me chal rahe hain."
+            )
+        else:
+            text = "🤖 **Bot is online and active!**\nGroup protection & auto-reactions are running."
+
+        bot.reply_to(message, text, parse_mode="Markdown")
+    except Exception:
+        logger.exception("Start command failed")
 
 
+# ============ MAIN ============
 def main():
     init_db()
-    try:
-        me = bot.get_me()
-        logger.info("Bot started: @%s", me.username)
-        logger.info("Database path: %s", DATABASE_PATH)
-        logger.info("Private channel configured: %s", CHANNEL_ID)
-        bot.infinity_polling(
-            skip_pending=True,
-            timeout=30,
-            long_polling_timeout=30,
-            allowed_updates=["message", "callback_query"]
-        )
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by keyboard interrupt")
-    except Exception:
-        logger.exception("Bot stopped due to an unexpected error")
-        raise
+
+    threading.Thread(
+        target=start_health_server, daemon=True, name="health-server"
+    ).start()
+
+    start_self_ping()
+    logger.info("Starting Telegram polling...")
+
+    while TypeGuard := True:
+        try:
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=25,
+                allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"],
+                skip_pending=False
+            )
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested")
+            break
+        except Exception:
+            logger.exception("Telegram polling failed; retrying in 5 seconds")
+            time.sleep(5)
 
 
 if __name__ == "__main__":
