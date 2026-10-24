@@ -16,6 +16,9 @@ APP_URL = os.environ.get("APP_URL", "https://adultbot-k29i.onrender.com").strip(
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
 
+# यहाँ अपने प्राइवेट ग्रुप या लॉग चैनल की ID डालें जहाँ सारे मैसेज फॉरवर्ड होंगे (जैसे: -1003907426148)
+LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0")) 
+
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
     raise RuntimeError("BOT_TOKEN missing. Render Dashboard mein BOT_TOKEN set karein.")
 
@@ -116,7 +119,6 @@ def get_all_logged_messages(chat_id):
         cursor.execute("SELECT content_hash FROM logged_messages WHERE content_hash LIKE ?", (prefix + "%",))
         results = []
         for row in cursor.fetchall():
-            # Remove chat_id prefix to show the actual text/link
             clean_text = row[0][len(prefix):]
             results.append(clean_text)
         return results
@@ -190,7 +192,6 @@ def is_group_admin(chat_id, user_id):
         member = bot.get_chat_member(chat_id, user_id)
         return member.status in ["creator", "administrator"]
     except Exception:
-        # Agar Telegram API error de, toh command chalane dene ke liye True maan lenge taaki command ruke nahi
         return True
 
 
@@ -218,14 +219,20 @@ def start_self_ping():
     threading.Thread(target=worker, daemon=True).start()
 
 
-# ============ MESSAGE FILTER & SPAM MUTE HANDLER ============
+# ============ MESSAGE FILTER & FORWARD HANDLER ============
 @bot.message_handler(func=lambda message: message.chat.type in ["group", "supergroup"] and (not message.text or not message.text.startswith("/")))
 def handle_group_messages(message):
     try:
         chat_id = message.chat.id
         user_id = message.from_user.id if message.from_user else None
 
+        # 1. Agar message bhejne wala admin hai toh ignore karein aur private log channel me forward karein
         if user_id and is_group_admin(chat_id, user_id):
+            if LOG_CHANNEL_ID != 0:
+                try:
+                    bot.forward_message(chat_id=LOG_CHANNEL_ID, from_chat_id=chat_id, message_id=message.id)
+                except Exception:
+                    pass
             return
 
         text = (message.text or message.caption or "").lower().strip()
@@ -234,6 +241,7 @@ def handle_group_messages(message):
 
         content_hash = f"{chat_id}_{text}"
 
+        # 2. Check karein ki kya ye message pehle se logged/blocked hai
         if is_message_logged(content_hash):
             spam_status = check_and_update_spam(user_id, content_hash)
             try:
@@ -251,6 +259,14 @@ def handle_group_messages(message):
                     threading.Thread(target=auto_delete_after_delay, args=(chat_id, [warn.id], 10)).start()
             except Exception:
                 pass
+        else:
+            # Agar naya message hai aur logged nahi hai, toh use private log channel me forward kar denge taaki aap wahan se log kar sakein
+            if LOG_CHANNEL_ID != 0:
+                try:
+                    bot.forward_message(chat_id=LOG_CHANNEL_ID, from_chat_id=chat_id, message_id=message.id)
+                except Exception:
+                    pass
+
     except Exception:
         logger.exception("Error in filter")
 
@@ -362,18 +378,19 @@ def set_mute_time_command(message):
 def log_command(message):
     try:
         chat_id = message.chat.id
-        if message.chat.type == "private":
-            return
-
+        # Allow /log command both in group or private log channel when replying to a message
         if not message.reply_to_message:
             sent = bot.reply_to(message, "⚠️ Kisi message par reply karke `/log` likhein.")
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            if chat_id != LOG_CHANNEL_ID:
+                threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
             return
 
         replied = message.reply_to_message
         text = (replied.text or replied.caption or "").lower().strip()
         if text:
-            content_hash = f"{chat_id}_{text}"
+            # Agar log channel se reply kiya gaya hai, toh original chat_id nikalne ke liye forward_from_chat check kar sakte hain, ya current chat_id use hoga
+            target_chat_id = chat_id
+            content_hash = f"{target_chat_id}_{text}"
             log_message_hash(content_hash)
 
             try:
@@ -381,11 +398,13 @@ def log_command(message):
             except Exception:
                 pass
 
-            sent = bot.reply_to(message, "🔒 **Post Locked & Deleted!**")
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            sent = bot.reply_to(message, "🔒 **Post Locked & Deleted from Log Channel!**")
+            if chat_id != LOG_CHANNEL_ID:
+                threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
         else:
             sent = bot.reply_to(message, "⚠️ Sirf text messages ko lock kiya ja sakta hai.")
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            if chat_id != LOG_CHANNEL_ID:
+                threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
     except Exception:
         logger.exception("Log error")
 
@@ -393,12 +412,8 @@ def log_command(message):
 def unlock_command(message):
     try:
         chat_id = message.chat.id
-        if message.chat.type == "private":
-            return
-
         if not message.reply_to_message:
             sent = bot.reply_to(message, "⚠️ Kisi locked message par reply karke `/unlock` likhein.")
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
             return
 
         replied = message.reply_to_message
@@ -410,11 +425,8 @@ def unlock_command(message):
                 sent = bot.reply_to(message, "✅ **Message Unlocked successfully!**")
             else:
                 sent = bot.reply_to(message, "ℹ️ Yeh message pehle se locked nahi tha.")
-            
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
         else:
             sent = bot.reply_to(message, "⚠️ Sirf text messages ke liye valid hai.")
-            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
     except Exception:
         logger.exception("Unlock error")
 
@@ -501,3 +513,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
