@@ -4,6 +4,7 @@ import sqlite3
 import threading
 import logging
 import random
+import re
 import requests
 import telebot
 from telebot import types
@@ -37,10 +38,8 @@ broadcast_states = {}
 
 
 # ============ DATABASE HELPERS ============
-fn_get_db = lambda: sqlite3.connect(DB_PATH, timeout=30)
-
 def get_db():
-    conn = fn_get_db()
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
@@ -57,7 +56,8 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS logged_messages (
-                content_hash TEXT PRIMARY KEY
+                content_hash TEXT PRIMARY KEY,
+                original_text TEXT
             )
         """)
         conn.execute("""
@@ -74,7 +74,7 @@ def init_db():
             )
         """)
         conn.commit()
-        logger.info("Database initialized successfully: %s", DB_PATH)
+        logger.info("Advanced Database initialized successfully: %s", DB_PATH)
     finally:
         conn.close()
 
@@ -103,7 +103,17 @@ def get_all_users():
         conn.close()
 
 
-def is_message_logged(content_hash):
+def normalize_text(text):
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def is_message_logged(text):
+    norm_text = normalize_text(text)
+    content_hash = f"msg_{hash(norm_text)}"
     conn = get_db()
     try:
         row = conn.execute(
@@ -114,24 +124,43 @@ def is_message_logged(content_hash):
         conn.close()
 
 
-def log_message_hash(content_hash):
+def log_message_text(text):
+    norm_text = normalize_text(text)
+    content_hash = f"msg_{hash(norm_text)}"
     conn = get_db()
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO logged_messages (content_hash) VALUES (?)",
-            (content_hash,)
+            "INSERT OR REPLACE INTO logged_messages (content_hash, original_text) VALUES (?, ?)",
+            (content_hash, text)
         )
         conn.commit()
     finally:
         conn.close()
 
 
+def remove_logged_message(text):
+    norm_text = normalize_text(text)
+    content_hash = f"msg_{hash(norm_text)}"
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM logged_messages WHERE content_hash = ?", (content_hash,)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
 def add_custom_keyword(keyword):
+    norm_kw = normalize_text(keyword)
+    if not norm_kw:
+        return
     conn = get_db()
     try:
         conn.execute(
             "INSERT OR IGNORE INTO blocked_keywords (keyword) VALUES (?)",
-            (keyword.lower().strip(),)
+            (norm_kw,)
         )
         conn.commit()
     finally:
@@ -139,11 +168,12 @@ def add_custom_keyword(keyword):
 
 
 def remove_custom_keyword(keyword):
+    norm_kw = normalize_text(keyword)
     conn = get_db()
     try:
         cursor = conn.execute(
             "DELETE FROM blocked_keywords WHERE keyword = ?",
-            (keyword.lower().strip(),)
+            (norm_kw,)
         )
         conn.commit()
         return cursor.rowcount > 0
@@ -278,7 +308,6 @@ def start_self_ping():
     threading.Thread(target=worker, daemon=True, name="self-ping").start()
 
 
-# ============ HELPER TO CHECK ADMIN STATUS ============
 def is_privileged(chat_id, user_id):
     if user_id == ADMIN_ID:
         return True
@@ -291,27 +320,51 @@ def is_privileged(chat_id, user_id):
     return False
 
 
-# ============ AUTO REACTIONS & MESSAGE FILTERING ============
+# ============ 1. CHANNEL POSTS HANDLER (Auto Reaction) ============
 @bot.channel_post_handler(func=lambda message: True)
-@bot.message_handler(func=lambda message: message.chat.type in ["group", "supergroup"] and (not message.text or not message.text.startswith("/")))
-def handle_reactions_and_filtering(message):
+def handle_channel_posts(message):
+    try:
+        chosen_reaction = random.choice(POSITIVE_REACTIONS)
+        bot.set_message_reaction(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            reaction=[types.ReactionTypeEmoji(chosen_reaction)]
+        )
+    except Exception:
+        pass
+
+
+# ============ 2. GROUP & PRIVATE CHAT MESSAGES HANDLER ============
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
     try:
         chat_id = message.chat.id
         message_id = message.id
         user_id = message.from_user.id if message.from_user else None
+        chat_type = message.chat.type
 
-        # 1. Linked Channel / Channel post bypass (sender_chat is present for linked channels)
-        if message.sender_chat:
-            return
-
-        # 2. Auto Positive Reaction
+        # Universal Auto Reaction on EVERY message (Private, Group, etc.)
         try:
             chosen_reaction = random.choice(POSITIVE_REACTIONS)
-            bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[types.ReactionTypeEmoji(chosen_reaction)])
+            bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[types.ReactionTypeEmoji(chosen_reaction)]
+            )
         except Exception:
             pass
 
-        # 3. Delete Service Messages (Join/Leave)
+        # If it's a private chat / DM, let command handlers process it (don't filter text in DM)
+        if chat_type == "private":
+            return
+
+        # --- GROUP & SUPERGROUP PROTECTION LOGIC ---
+        
+        # A. Linked Channel / Channel post bypass
+        if message.sender_chat:
+            return
+
+        # B. Delete Service Messages (Join/Leave)
         if message.content_type in ["new_chat_members", "left_chat_member", "group_chat_created", "migrate_to_chat_id"]:
             try:
                 bot.delete_message(chat_id, message_id)
@@ -319,11 +372,11 @@ def handle_reactions_and_filtering(message):
                 pass
             return
 
-        # 4. Check if user is admin or owner (Bypass filters)
+        # C. Check if user is admin or owner (Bypass filters)
         if user_id and is_privileged(chat_id, user_id):
             return
 
-        # 5. Check Mute Status
+        # D. Check Mute Status
         if user_id:
             remaining_time = get_user_mute_status(user_id)
             if remaining_time > 0:
@@ -333,59 +386,90 @@ def handle_reactions_and_filtering(message):
                     pass
                 return
 
-        # 6. Text filtering (Default URL, t.me, @username + Custom Added Keywords)
-        if message.text:
-            text_lower = message.text.lower()
-            
-            # Built-in check
-            has_url = "http://" in text_lower or "https://" in text_lower or "www." in text_lower or "t.me/" in text_lower or ("@" in text_lower and not message.text.startswith("/"))
-            
-            # Custom keyword check from DB
-            custom_keywords = get_custom_keywords()
-            has_custom_keyword = any(kw in text_lower for kw in custom_keywords if kw.strip())
+        # E. Advanced Text Filtering
+        if message.text and not message.text.startswith("/"):
+            raw_text = message.text
+            norm_text = normalize_text(raw_text)
 
-            if has_url or has_custom_keyword:
+            # 1. URL / t.me / @ username check
+            has_url = "http://" in norm_text or "https://" in norm_text or "www." in norm_text or "t.me/" in norm_text or "@" in norm_text
+            
+            # 2. Custom Keyword check from DB
+            custom_keywords = get_custom_keywords()
+            has_custom_keyword = any(kw in norm_text for kw in custom_keywords if kw)
+
+            # 3. Logged / Exact Match Message Check
+            is_logged_match = is_message_logged(raw_text)
+
+            if has_url or has_custom_keyword or is_logged_match:
                 try:
                     bot.delete_message(chat_id, message_id)
+                    
+                    if user_id and (is_logged_match or has_custom_keyword):
+                        content_hash = f"hash_{hash(norm_text)}"
+                        spam_status = check_and_update_spam(user_id, content_hash)
+                        if spam_status == "just_muted":
+                            bot.send_message(chat_id, f"⚠️ {message.from_user.first_name}, you have been muted for 15 minutes due to repeated spamming.")
                     return
                 except Exception:
                     pass
 
-            # Logged / Duplicate Message Filter
-            content_hash = f"{chat_id}_{text_lower.strip()}"
-            if is_message_logged(content_hash):
-                spam_status = check_and_update_spam(user_id, content_hash)
-                try:
-                    bot.delete_message(chat_id, message_id)
-                    if spam_status == "just_muted":
-                        bot.send_message(chat_id, f"⚠️ {message.from_user.first_name}, you have been muted for 15 minutes due to repeated spamming.")
-                except Exception:
-                    pass
-                return
-
     except Exception:
-        logger.exception("Error in filter handler")
+        logger.exception("Error in message handler")
 
 
-# ============ ADMIN COMMANDS (LOG, ADD, UNMUTE) ============
+# ============ ADMIN COMMANDS (LOG, LOCK, UNLOCK, ADD, REMOVE) ============
 @bot.message_handler(commands=["log", "lock"])
 def log_custom_message(message):
     try:
         if message.from_user.id != ADMIN_ID:
             return
         if not message.reply_to_message:
-            bot.reply_to(message, "⚠️ Reply to any message with /log (or /lock) to blacklist it.")
+            bot.reply_to(message, "⚠️ Reply to any message with /log (or /lock) to permanently lock and blacklist it.")
             return
 
         replied_msg = message.reply_to_message
         if replied_msg.text:
-            content_hash = f"{replied_msg.chat.id}_{replied_msg.text.lower().strip()}"
-            log_message_hash(content_hash)
-            bot.reply_to(message, "✅ Locked! Future instances of this message will be automatically deleted.")
+            text_to_lock = replied_msg.text
+            log_message_text(text_to_lock)
+            
+            words = text_to_lock.split()
+            for w in words:
+                if "http://" in w or "https://" in w or "www." in w or "t.me/" in w or "@" in w:
+                    add_custom_keyword(w)
+
+            bot.reply_to(message, "🔒 **Advanced Locked!**\nThis message and its contents are now permanently blacklisted.", parse_mode="Markdown")
         else:
-            bot.reply_to(message, "⚠️ Only text messages can be logged.")
+            bot.reply_to(message, "⚠️ Only text messages can be locked.")
     except Exception:
         logger.exception("Log command failed")
+
+
+@bot.message_handler(commands=["unlock"])
+def unlock_message_command(message):
+    try:
+        if message.from_user.id != ADMIN_ID:
+            return
+        
+        text_to_unlock = ""
+        if message.reply_to_message and message.reply_to_message.text:
+            text_to_unlock = message.reply_to_message.text
+        else:
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                bot.reply_to(message, "Usage:\n1. Reply to a locked message with `/unlock`\n2. Or type `/unlock <word_or_url>`", parse_mode="Markdown")
+                return
+            text_to_unlock = parts[1].strip()
+
+        removed_log = remove_logged_message(text_to_unlock)
+        removed_kw = remove_custom_keyword(text_to_unlock)
+
+        if removed_log or removed_kw:
+            bot.reply_to(message, f"🔓 **Successfully Unlocked!**\n`{text_to_unlock[:50]}` is now removed from the blacklist.", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "⚠️ This message or keyword was not found in the locked/blacklist records.")
+    except Exception:
+        logger.exception("Unlock command failed")
 
 
 @bot.message_handler(commands=["add"])
@@ -395,11 +479,11 @@ def add_keyword_command(message):
             return
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            bot.reply_to(message, "Usage: `/add <word_or_url>`", parse_mode="Markdown")
+            bot.reply_to(message, "Usage: `/add <word_phrase_or_url>`", parse_mode="Markdown")
             return
         kw = parts[1].strip()
         add_custom_keyword(kw)
-        bot.reply_to(message, f"✅ Added to blocked list: `{kw}`", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Added to advanced blocklist: `{kw}`", parse_mode="Markdown")
     except Exception:
         logger.exception("Add keyword failed")
 
@@ -411,13 +495,13 @@ def remove_keyword_command(message):
             return
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            bot.reply_to(message, "Usage: `/remove <word_or_url>`", parse_mode="Markdown")
+            bot.reply_to(message, "Usage: `/remove <word_phrase_or_url>`", parse_mode="Markdown")
             return
         kw = parts[1].strip()
-        if remove_custom_keyword(kw):
-            bot.reply_to(message, f"✅ Removed from blocked list: `{kw}`", parse_mode="Markdown")
+        if remove_custom_keyword(kw) or remove_logged_message(kw):
+            bot.reply_to(message, f"✅ Removed from blocklist: `{kw}`", parse_mode="Markdown")
         else:
-            bot.reply_to(message, f"⚠️ Keyword not found in blocked list.")
+            bot.reply_to(message, f"⚠️ Keyword not found in blocklist.")
     except Exception:
         logger.exception("Remove keyword failed")
 
@@ -431,7 +515,7 @@ def list_keywords_command(message):
         if not keywords:
             bot.reply_to(message, "📋 No custom blocked words/URLs added yet.")
             return
-        text = "📋 **Blocked Keywords & URLs:**\n\n" + "\n".join(f"• `{kw}`" for kw in keywords)
+        text = "📋 **Advanced Blocked Keywords & URLs:**\n\n" + "\n".join(f"• `{kw}`" for kw in keywords)
         bot.reply_to(message, text, parse_mode="Markdown")
     except Exception:
         logger.exception("List keywords failed")
@@ -455,13 +539,13 @@ def unmute_user_command(message):
         logger.exception("Unmute command failed")
 
 
-# ============ BROADCAST SYSTEM WITH BUTTON ============
+# ============ BROADCAST SYSTEM ============
 @bot.message_handler(commands=["broadcast"])
 def broadcast_command(message):
     if message.from_user.id != ADMIN_ID:
         return
     broadcast_states[ADMIN_ID] = True
-    bot.reply_to(message, "📢 **Broadcast Mode Activated!**\n\nAb aap jo bhi bhejenge (Media, Video, Text, Link ke sath), woh sabhi users ko broadcast ho jayega.\nCancel karne ke liye `/cancel` bhejein.")
+    bot.reply_to(message, "📢 **Broadcast Mode Activated!**\n\nAb jo bhi bhejenge (Media, Video, Text, Link ke sath), woh sabhi users ko broadcast ho jayega.\nCancel karne ke liye `/cancel` bhejein.")
 
 
 @bot.message_handler(commands=["cancel"])
@@ -506,7 +590,7 @@ def execute_broadcast(message):
         pass
 
 
-# ============ START COMMAND WITH REPLY KEYBOARD BUTTON ============
+# ============ START COMMAND WITH REPLY KEYBOARD ============
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
     try:
@@ -515,59 +599,14 @@ def send_welcome(message):
         add_user(user_id, first_name)
 
         if user_id == ADMIN_ID:
-            # Create reply keyboard with Broadcast button
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
             broadcast_btn = types.KeyboardButton("📢 Broadcast")
             markup.add(broadcast_btn)
 
             text = (
-                "👑 **Admin Control Panel**\n\n"
+                "👑 **Advanced Admin Control Panel**\n\n"
                 "• **Broadcast:** Niche diye gaye button par click karein.\n"
-                "• **Add Word/URL:** `/add <keyword>`\n"
-                "• **Remove Word:** `/remove <keyword>`\n"
-                "• **View List:** `/listwords`\n"
-                "• **Log Message:** Reply message + `/log` (ya `/lock`)\n"
-                "• **Unmute User:** `/unmute <user_id>`"
-            )
-            bot.reply_to(message, text, reply_markup=markup, parse_mode="Markdown")
-        else:
-            text = "🤖 **Bot is online and active!**\nGroup protection & auto-reactions are running."
-            bot.reply_to(message, text, parse_mode="Markdown")
-    except Exception:
-        logger.exception("Start command failed")
-
-
-# Handle Button Click for Broadcast
-@bot.message_handler(func=lambda msg: msg.from_user.id == ADMIN_ID and msg.text == "📢 Broadcast")
-def handle_broadcast_button(message):
-    broadcast_states[ADMIN_ID] = True
-    bot.reply_to(message, "📢 **Broadcast Mode Activated via Button!**\n\nAb jo bhi message/media bhejenge woh sabko broadcast ho jayega. Cancel karne ke liye `/cancel` bhejein.")
-
-
-# ============ MAIN ============
-def main():
-    init_db()
-
-    threading.Thread(target=start_health_server, daemon=True, name="health-server").start()
-    start_self_ping()
-    logger.info("Starting Telegram polling...")
-
-    while True:
-        try:
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=25,
-                allowed_updates=["message", "channel_post", "edited_message", "edited_channel_post"],
-                skip_pending=False
-            )
-        except KeyboardInterrupt:
-            logger.info("Shutdown requested")
-            break
-        except Exception:
-            logger.exception("Polling failed; retrying in 5 seconds")
-            time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()
-    
+                "• **Add Word/URL:** `/add <word_or_url>`\n"
+                "• **Remove Word:** `/remove <word_or_url>`\n"
+                "• **View Blocklist:** `/listwords`\n"
+                "• **Lock Message:** Reply messa
