@@ -3,23 +3,26 @@ import time
 import sqlite3
 import threading
 import logging
-import random
-import re
 import requests
 import telebot
-from telebot import types
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from requests.adapters import HTTPAdapter
 
 # ============ CONFIGURATION ============
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ADMIN_ID = 5989928539
 APP_URL = os.environ.get("APP_URL", "https://osint-s7db.onrender.com").strip().rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
 
-POSITIVE_REACTIONS = ["👍", "❤️", "🔥", "👏", "🎉", "🤩", "💯"]
+# ONLY ALLOWED GROUPS
+ALLOWED_GROUP_IDS = [
+    -1001612436840,  # GROUP 1 ID
+    -1002862248348,  # GROUP 2 ID
+]
+
+# ADMIN LIST
+ADMIN_IDS = [5989928539, 1087968824]
 
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
     raise RuntimeError(
@@ -56,21 +59,18 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS logged_messages (
-                content_hash TEXT PRIMARY KEY,
-                original_text TEXT
+                content_hash TEXT PRIMARY KEY
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS blocked_keywords (
-                keyword TEXT PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS protected_users (
+                user_id INTEGER PRIMARY KEY
             )
         """)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_spam (
-                user_id INTEGER PRIMARY KEY,
-                last_msg_hash TEXT,
-                count INTEGER DEFAULT 1,
-                mute_until REAL DEFAULT 0
+            CREATE TABLE IF NOT EXISTS whitelisted_channels (
+                channel_id INTEGER PRIMARY KEY,
+                channel_title TEXT
             )
         """)
         conn.commit()
@@ -103,27 +103,7 @@ def get_all_users():
         conn.close()
 
 
-def get_blocklist_counts():
-    conn = get_db()
-    try:
-        logged_count = conn.execute("SELECT COUNT(*) FROM logged_messages").fetchone()[0]
-        keyword_count = conn.execute("SELECT COUNT(*) FROM blocked_keywords").fetchone()[0]
-        return logged_count, keyword_count
-    finally:
-        conn.close()
-
-
-def normalize_text(text):
-    if not text:
-        return ""
-    text = text.lower().strip()
-    text = re.sub(r'\s+', ' ', text)
-    return text
-
-
-def is_message_logged(text):
-    norm_text = normalize_text(text)
-    content_hash = f"msg_{hash(norm_text)}"
+def is_message_logged(content_hash):
     conn = get_db()
     try:
         row = conn.execute(
@@ -134,160 +114,111 @@ def is_message_logged(text):
         conn.close()
 
 
-def log_message_text(text):
-    norm_text = normalize_text(text)
-    content_hash = f"msg_{hash(norm_text)}"
+def log_message_hash(content_hash):
     conn = get_db()
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO logged_messages (content_hash, original_text) VALUES (?, ?)",
-            (content_hash, text)
+            "INSERT OR IGNORE INTO logged_messages (content_hash) VALUES (?)",
+            (content_hash,)
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def remove_logged_message_by_text(text):
-    norm_text = normalize_text(text)
-    content_hash = f"msg_{hash(norm_text)}"
+def unlock_message_hash(content_hash):
     conn = get_db()
     try:
-        cursor = conn.execute(
-            "DELETE FROM logged_messages WHERE content_hash = ?", (content_hash,)
-        )
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM logged_messages WHERE content_hash = ?", (content_hash,))
         conn.commit()
         return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-def add_custom_keyword(keyword):
-    norm_kw = normalize_text(keyword)
-    if not norm_kw:
-        return
+def is_user_protected(user_id):
     conn = get_db()
     try:
-        conn.execute(
-            "INSERT OR IGNORE INTO blocked_keywords (keyword) VALUES (?)",
-            (norm_kw,)
-        )
-        conn.commit()
+        row = conn.execute("SELECT 1 FROM protected_users WHERE user_id = ?", (user_id,)).fetchone()
+        return row is not None
     finally:
         conn.close()
 
 
-def remove_custom_keyword(keyword):
-    norm_kw = normalize_text(keyword)
+def set_user_protection(user_id, protect=True):
     conn = get_db()
     try:
-        cursor = conn.execute(
-            "DELETE FROM blocked_keywords WHERE keyword = ?",
-            (norm_kw,)
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
-        conn.close()
-
-
-def get_custom_keywords():
-    conn = get_db()
-    try:
-        rows = conn.execute("SELECT keyword FROM blocked_keywords").fetchall()
-        return [r[0] for r in rows]
-    finally:
-        conn.close()
-
-
-def check_and_update_spam(user_id, content_hash):
-    conn = get_db()
-    now = time.time()
-    try:
-        row = conn.execute(
-            "SELECT last_msg_hash, count, mute_until FROM user_spam WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-
-        if row:
-            last_hash, count, mute_until = row
-            if now < mute_until:
-                return "muted"
-
-            if last_hash == content_hash:
-                count += 1
-            else:
-                count = 1
-                last_hash = content_hash
-
-            if count >= 4:
-                mute_until = now + 900
-                conn.execute(
-                    "UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = ? WHERE user_id = ?",
-                    (last_hash, count, mute_until, user_id)
-                )
-                conn.commit()
-                return "just_muted"
-            else:
-                conn.execute(
-                    "UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = 0 WHERE user_id = ?",
-                    (last_hash, count, user_id)
-                )
-                conn.commit()
-                return "active"
+        if protect:
+            conn.execute("INSERT OR IGNORE INTO protected_users (user_id) VALUES (?)", (user_id,))
         else:
-            conn.execute(
-                "INSERT INTO user_spam (user_id, last_msg_hash, count, mute_until) VALUES (?, ?, 1, 0)",
-                (user_id, content_hash)
-            )
-            conn.commit()
-            return "active"
+            conn.execute("DELETE FROM protected_users WHERE user_id = ?", (user_id,))
+        conn.commit()
     finally:
         conn.close()
 
 
-def get_user_mute_status(user_id):
+def is_channel_whitelisted(channel_id):
     conn = get_db()
-    now = time.time()
     try:
-        row = conn.execute(
-            "SELECT mute_until FROM user_spam WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if row and row[0] > now:
-            return int(row[0] - now)
-        return 0
+        row = conn.execute("SELECT 1 FROM whitelisted_channels WHERE channel_id = ?", (channel_id,)).fetchone()
+        return row is not None
     finally:
         conn.close()
 
 
-def clear_user_mute(user_id):
+def add_whitelisted_channel(channel_id, title="Channel"):
     conn = get_db()
     try:
-        cursor = conn.execute(
-            "UPDATE user_spam SET mute_until = 0, count = 0 WHERE user_id = ?",
-            (user_id,)
-        )
+        conn.execute("""
+            INSERT INTO whitelisted_channels (channel_id, channel_title)
+            VALUES (?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET channel_title = excluded.channel_title
+        """, (channel_id, title))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def remove_whitelisted_channel(channel_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM whitelisted_channels WHERE channel_id = ?", (channel_id,))
         conn.commit()
         return cursor.rowcount > 0
     finally:
         conn.close()
 
 
-# ============ HEALTH-CHECK & SELF-PING ============
+def is_group_admin(chat_id, user_id):
+    if user_id in ADMIN_IDS:
+        return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status in ["creator", "administrator"]
+    except Exception:
+        return False
+
+
+# ============ HEALTH-CHECK WEB SERVER ============
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path not in ("/", "/health"):
             self.send_response(404)
             self.end_headers()
             return
+
         body = b"Bot service is running"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
     def log_message(self, fmt, *args):
         pass
+
 
 def start_health_server():
     try:
@@ -296,316 +227,351 @@ def start_health_server():
         logger.info("Health server listening on port %s", PORT)
         server.serve_forever()
     except Exception:
-        logger.exception("Health server failed")
+        logger.exception("Health server failed to start")
+
 
 def start_self_ping():
     session = requests.Session()
     try:
         from urllib3.util.retry import Retry
-        retry = Retry(total=2, connect=2, read=2, backoff_factor=1, status_forcelist=[500,502,503,504], allowed_methods=["GET"])
+        retry = Retry(
+            total=2, connect=2, read=2, backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504], allowed_methods=["GET"]
+        )
         session.mount("https://", HTTPAdapter(max_retries=retry))
     except Exception:
         pass
+
     def worker():
         time.sleep(20)
         while True:
             try:
-                res = session.get(APP_URL + "/health", timeout=15)
-                res.close()
-            except Exception:
+                response = session.get(APP_URL + "/health", timeout=15)
+                response.close()
+            except requests.RequestException:
                 pass
             time.sleep(180)
+
     threading.Thread(target=worker, daemon=True, name="self-ping").start()
 
 
-def is_privileged(chat_id, user_id):
-    if user_id == ADMIN_ID:
-        return True
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status in ["creator", "administrator"]:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-# ============ SAFE REACTION SENDER ============
-def send_random_reaction(chat_id, message_id):
-    try:
-        chosen_reaction = random.choice(POSITIVE_REACTIONS)
-        bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[types.ReactionTypeEmoji(emoji=chosen_reaction)],
-            is_big=False
-        )
-    except Exception as e:
-        logger.error(f"Reaction failed: {e}")
-
-
-# ============ 1. CHANNEL POSTS HANDLER ============
+# ============ MESSAGE FILTERING SYSTEM ============
 @bot.channel_post_handler(func=lambda message: True)
-def handle_channel_posts(message):
-    send_random_reaction(message.chat.id, message.id)
-
-
-# ============ 2. GROUP & PRIVATE CHAT MESSAGES HANDLER ============
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
+@bot.message_handler(func=lambda message: message.chat.id in ALLOWED_GROUP_IDS and (not message.text or not message.text.startswith("/")))
+def handle_group_filtering(message):
     try:
         chat_id = message.chat.id
         message_id = message.id
         user_id = message.from_user.id if message.from_user else None
-        chat_type = message.chat.type
 
-        # Give random positive reaction on EVERY message (Hi, Hello, Start, etc.)
-        send_random_reaction(chat_id, message_id)
-
-        # If Private Chat, stop further filtering
-        if chat_type == "private":
+        if chat_id not in ALLOWED_GROUP_IDS or message.chat.type == "private":
             return
 
-        # --- GROUP & SUPERGROUP PROTECTION LOGIC ---
-        if message.sender_chat:
-            return
+        is_protected = False
 
-        # Delete Service Messages (Join/Leave)
-        if message.content_type in ["new_chat_members", "left_chat_member", "group_chat_created", "migrate_to_chat_id"]:
+        if user_id and user_id in ADMIN_IDS:
+            is_protected = True
+        if not is_protected and user_id and is_user_protected(user_id):
+            is_protected = True
+        if not is_protected and user_id:
             try:
-                bot.delete_message(chat_id, message_id)
+                member = bot.get_chat_member(chat_id, user_id)
+                if member.status in ["administrator", "creator"]:
+                    is_protected = True
             except Exception:
                 pass
-            return
+        if not is_protected:
+            try:
+                if message.sender_chat and message.sender_chat.id == chat_id:
+                    is_protected = True
+            except Exception:
+                pass
+        if not is_protected:
+            try:
+                if message.is_automatic_forward and message.sender_chat:
+                    linked_chat = bot.get_chat(chat_id=chat_id)
+                    if linked_chat.linked_chat_id and message.sender_chat.id == linked_chat.linked_chat_id:
+                        is_protected = True
+            except Exception:
+                pass
+        if not is_protected:
+            try:
+                if message.forward_from_chat and is_channel_whitelisted(message.forward_from_chat.id):
+                    is_protected = True
+                elif message.sender_chat and is_channel_whitelisted(message.sender_chat.id):
+                    is_protected = True
+            except Exception:
+                pass
 
-        if user_id and is_privileged(chat_id, user_id):
-            return
+        if not is_protected:
+            text = (message.text or message.caption or "").lower()
 
-        if user_id:
-            remaining_time = get_user_mute_status(user_id)
-            if remaining_time > 0:
+            is_media_file = False
+            try:
+                if message.animation or message.document or message.sticker:
+                    is_media_file = True
+            except Exception:
+                pass
+
+            has_inline_keyboard = False
+            try:
+                if message.reply_markup and hasattr(message.reply_markup, "inline_keyboard"):
+                    if message.reply_markup.inline_keyboard:
+                        has_inline_keyboard = True
+            except Exception:
+                pass
+
+            is_forwarded = False
+            try:
+                if message.forward_from or message.forward_from_chat or message.forward_from_message_id or message.is_automatic_forward:
+                    is_forwarded = True
+                if hasattr(message, "forward_origin") and message.forward_origin:
+                    is_forwarded = True
+            except Exception:
+                pass
+
+            is_story = False
+            try:
+                if getattr(message, "story", None) or getattr(message, "media_story", None):
+                    is_story = True
+                if hasattr(message, "forward_origin") and message.forward_origin:
+                    if getattr(message.forward_origin, "type", None) == "story":
+                        is_story = True
+            except Exception:
+                pass
+
+            is_text_quoted = False
+            try:
+                entities = message.entities or message.caption_entities or []
+                for entity in entities:
+                    if entity.type in ["blockquote", "expanded_blockquote"]:
+                        is_text_quoted = True
+                        break
+            except Exception:
+                pass
+
+            content_hash = f"{chat_id}_{text.strip()}"
+            is_blacklisted = is_message_logged(content_hash)
+
+            if (
+                is_media_file
+                or has_inline_keyboard
+                or is_forwarded
+                or is_story
+                or is_text_quoted
+                or is_blacklisted
+                or "http://" in text
+                or "https://" in text
+                or "@" in text
+                or "join" in text
+                or "🔞" in text
+                or "💋" in text
+                or "maderchod" in text
+                or "👇" in text
+                or "👈" in text
+                or "18+" in text
+                or "_bot" in text
+                or "http://t.me/" in text
+                or "forwarded" in text
+                or "sexy" in text
+                or "bot" in text
+                or "bot?start=" in text
+                or "t.me" in text
+                or "sex" in text
+                or "🥵" in text
+                or "18" in text
+                or "#" in text
+                or "mms" in text
+                or "porn" in text
+                or "teen" in text
+                or "www." in text
+                or "cam" in text
+            ):
                 try:
-                    bot.delete_message(chat_id, message_id)
-                except Exception:
-                    pass
-                return
-
-        if message.text and not message.text.startswith("/"):
-            raw_text = message.text
-            norm_text = normalize_text(raw_text)
-
-            has_url = "http://" in norm_text or "https://" in norm_text or "www." in norm_text or "t.me/" in norm_text or "@" in norm_text
-            custom_keywords = get_custom_keywords()
-            has_custom_keyword = any(kw in norm_text for kw in custom_keywords if kw)
-            is_logged_match = is_message_logged(raw_text)
-
-            if has_url or has_custom_keyword or is_logged_match:
-                try:
-                    bot.delete_message(chat_id, message_id)
-                    if user_id and (is_logged_match or has_custom_keyword):
-                        content_hash = f"hash_{hash(norm_text)}"
-                        spam_status = check_and_update_spam(user_id, content_hash)
-                        if spam_status == "just_muted":
-                            bot.send_message(chat_id, f"⚠️ {message.from_user.first_name}, you have been muted for 15 minutes due to repeated spamming.")
-                    return
+                    bot.delete_message(chat_id=chat_id, message_id=message.id)
                 except Exception:
                     pass
 
     except Exception:
-        logger.exception("Error in message handler")
+        logger.exception("Error in group filter handler")
 
 
-# ============ ADMIN COMMANDS (LOG, LOCK, UNLOCK, ADD, REMOVE) ============
-@bot.message_handler(commands=["log", "lock"])
+# ============ ADMIN COMMANDS (LOG / UNLOCK / PROTECT / CHANNEL) ============
+
+@bot.message_handler(commands=["log"])
 def log_custom_message(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
         if not message.reply_to_message:
-            bot.reply_to(message, "⚠️ Reply to any message with /log (or /lock) to permanently lock and blacklist it.")
+            sent = bot.reply_to(message, "⚠️ Kisi message par reply karke `/log` bhejein.")
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
             return
 
         replied_msg = message.reply_to_message
-        if replied_msg.text:
-            text_to_lock = replied_msg.text
-            log_message_text(text_to_lock)
+        if replied_msg.text or replied_msg.caption:
+            content_text = (replied_msg.text or replied_msg.caption).lower().strip()
+            content_hash = f"{replied_msg.chat.id}_{content_text}"
+            log_message_hash(content_hash)
             
-            words = text_to_lock.split()
-            for w in words:
-                if "http://" in w or "https://" in w or "www." in w or "t.me/" in w or "@" in w:
-                    add_custom_keyword(w)
+            # Delete the targeted message that is now locked
+            try:
+                bot.delete_message(chat_id=replied_msg.chat.id, message_id=replied_msg.id)
+            except Exception:
+                pass
 
-            bot.reply_to(message, "🔒 **Locked Successfully!**\nThis message is now blacklisted and will be auto-deleted.", parse_mode="Markdown")
+            sent = bot.reply_to(message, "🔒 **Post Locked & Deleted!** Yeh message blacklist ho gaya hai aur delete kar diya gaya hai.")
+            # Auto delete command message and bot reply after 5 seconds
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
         else:
-            bot.reply_to(message, "⚠️ Only text messages can be locked.")
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ya captions ko hi lock kiya ja sakta hai.")
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
     except Exception:
         logger.exception("Log command failed")
 
 
 @bot.message_handler(commands=["unlock"])
-def unlock_message_command(message):
+def unlock_custom_message(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
-        
-        text_to_unlock = ""
-        if message.reply_to_message and message.reply_to_message.text:
-            text_to_unlock = message.reply_to_message.text
-        else:
-            parts = message.text.split(maxsplit=1)
-            if len(parts) < 2:
-                bot.reply_to(message, "Usage:\n1. Reply to any locked message with `/unlock`\n2. Or type `/unlock <exact_word_or_phrase>`", parse_mode="Markdown")
-                return
-            text_to_unlock = parts[1].strip()
+        if not message.reply_to_message:
+            sent = bot.reply_to(message, "⚠️ Kisi locked message par reply karke `/unlock` bhejein.")
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
+            return
 
-        removed_log = remove_logged_message_by_text(text_to_unlock)
-        removed_kw = remove_custom_keyword(text_to_unlock)
-
-        if removed_log or removed_kw:
-            bot.reply_to(message, f"✅ **Successfully Unlocked!**\n`{text_to_unlock[:50]}` is now removed from the blocklist and can be sent freely.", parse_mode="Markdown")
+        replied_msg = message.reply_to_message
+        if replied_msg.text or replied_msg.caption:
+            content_text = (replied_msg.text or replied_msg.caption).lower().strip()
+            content_hash = f"{replied_msg.chat.id}_{content_text}"
+            unlocked = unlock_message_hash(content_hash)
+            if unlocked:
+                sent = bot.reply_to(message, "✅ **Message Unlocked successfully!** Ab yeh message dobara bheja ja sakta hai.")
+            else:
+                sent = bot.reply_to(message, "ℹ️ Yeh message pehle se locked/blacklisted nahi tha.")
+            
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
         else:
-            bot.reply_to(message, "⚠️ This message or keyword was not found in the locked/blacklist records.")
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ke liye valid hai.")
+            threading.Thread(target=auto_delete_messages, args=(message.chat.id, [message.id, sent.id], 5)).start()
     except Exception:
         logger.exception("Unlock command failed")
 
 
-@bot.message_handler(commands=["add"])
-def add_keyword_command(message):
+def auto_delete_messages(chat_id, message_ids, delay=5):
+    time.sleep(delay)
+    for msg_id in message_ids:
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+
+
+@bot.message_handler(commands=["protect"])
+def protect_user_cmd(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            bot.reply_to(message, "Usage: `/add <word_phrase_or_url>`", parse_mode="Markdown")
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            bot.reply_to(message, "⚠️ Kisi user ke message par reply karke `/protect` bhejein.")
             return
-        kw = parts[1].strip()
-        add_custom_keyword(kw)
-        bot.reply_to(message, f"✅ Added to blocklist: `{kw}`", parse_mode="Markdown")
+
+        target_user = message.reply_to_message.from_user
+        set_user_protection(target_user.id, protect=True)
+        bot.reply_to(message, f"🛡️ User **{target_user.first_name}** ko protect kar diya gaya hai.")
     except Exception:
-        logger.exception("Add keyword failed")
+        logger.exception("Protect command failed")
 
 
-@bot.message_handler(commands=["remove", "del"])
-def remove_keyword_command(message):
+@bot.message_handler(commands=["unprotect"])
+def unprotect_user_cmd(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            bot.reply_to(message, "Usage: `/remove <word_phrase_or_url>`", parse_mode="Markdown")
+        if not message.reply_to_message or not message.reply_to_message.from_user:
+            bot.reply_to(message, "⚠️ Kisi user के message par reply karke `/unprotect` bhejein.")
             return
-        kw = parts[1].strip()
-        if remove_custom_keyword(kw) or remove_logged_message_by_text(kw):
-            bot.reply_to(message, f"✅ Removed from blocklist: `{kw}`", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, f"⚠️ Keyword not found in blocklist.")
+
+        target_user = message.reply_to_message.from_user
+        set_user_protection(target_user.id, protect=False)
+        bot.reply_to(message, f"🔓 User **{target_user.first_name}** ki protection hata di gayi hai.")
     except Exception:
-        logger.exception("Remove keyword failed")
+        logger.exception("Unprotect command failed")
 
 
-@bot.message_handler(commands=["listwords", "list"])
-def list_keywords_command(message):
+@bot.message_handler(commands=["addchannel"])
+def add_channel_cmd(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
-        logged_cnt, kw_cnt = get_blocklist_counts()
-        keywords = get_custom_keywords()
         
-        text = f"📋 **Blocklist Status:**\n• Locked Messages: `{logged_cnt}`\n• Custom Keywords/URLs: `{kw_cnt}`\n\n"
-        if keywords:
-            text += "**Keywords List:**\n" + "\n".join(f"• `{kw}`" for kw in keywords[:30])
-        bot.reply_to(message, text, parse_mode="Markdown")
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "⚠️ Sahi format use karein:\n`/addchannel -100xxxxxxxxxx`")
+            return
+
+        try:
+            channel_id = int(args[1])
+        except ValueError:
+            bot.reply_to(message, "⚠️ Channel ID sirf numbers me honi chahiye.")
+            return
+
+        add_whitelisted_channel(channel_id, title=f"Channel {channel_id}")
+        bot.reply_to(message, f"✅ Channel ID `{channel_id}` ko whitelist kar diya gaya hai!")
     except Exception:
-        logger.exception("List keywords failed")
+        logger.exception("Add channel failed")
 
 
-@bot.message_handler(commands=["unmute"])
-def unmute_user_command(message):
+@bot.message_handler(commands=["delchannel"])
+def del_channel_cmd(message):
     try:
-        if message.from_user.id != ADMIN_ID:
+        if message.from_user.id not in ADMIN_IDS and not is_group_admin(message.chat.id, message.from_user.id):
             return
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip().isdigit():
-            bot.reply_to(message, "Usage: `/unmute <user_id>`", parse_mode="Markdown")
+        
+        args = message.text.split()
+        if len(args) < 2:
+            bot.reply_to(message, "⚠️ Sahi format use karein:\n`/delchannel -100xxxxxxxxxx`")
             return
-        target_uid = int(parts[1].strip())
-        if clear_user_mute(target_uid):
-            bot.reply_to(message, f"✅ User `{target_uid}` has been unmuted successfully.", parse_mode="Markdown")
+
+        try:
+            channel_id = int(args[1])
+        except ValueError:
+            bot.reply_to(message, "⚠️ Channel ID valid number honi chahiye.")
+            return
+
+        removed = remove_whitelisted_channel(channel_id)
+        if removed:
+            bot.reply_to(message, f"🗑️ Channel ID `{channel_id}` ko whitelist se hata diya gaya hai.")
         else:
-            bot.reply_to(message, f"⚠️ User `{target_uid}` was not found in spam/mute records.", parse_mode="Markdown")
+            bot.reply_to(message, "ℹ️ Yeh Channel ID whitelist me nahi mili.")
     except Exception:
-        logger.exception("Unmute command failed")
+        logger.exception("Del channel failed")
 
 
-# ============ BROADCAST SYSTEM ============
+# ============ ADMIN BROADCAST SYSTEM ============
 @bot.message_handler(commands=["broadcast"])
 def broadcast_command(message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         return
-    broadcast_states[ADMIN_ID] = True
-    bot.reply_to(message, "📢 **Broadcast Mode Activated!**\n\nAb jo bhi bhejenge (Media, Video, Text, Link ke sath), woh sabhi users ko broadcast ho jayega.\nCancel karne ke liye `/cancel` bhejein.")
+    
+    broadcast_states[message.from_user.id] = True
+    bot.reply_to(message, "📢 **Broadcast Mode Activated!**\n\nAb aap jo bhi bhejenge, woh saare users ko broadcast kar diya jayega.\n\nCancel karne ke liye `/cancel` bhejein.")
 
 
 @bot.message_handler(commands=["cancel"])
 def cancel_broadcast(message):
-    if message.from_user.id != ADMIN_ID:
+    if message.from_user.id not in ADMIN_IDS:
         return
-    if ADMIN_ID in broadcast_states:
-        del broadcast_states[ADMIN_ID]
-        bot.reply_to(message, "❌ Broadcast cancelled.")
+    if message.from_user.id in broadcast_states:
+        broadcast_states.pop(message.from_user.id, None)
+        bot.reply_to(message, "❌ Broadcast mode cancelled.")
     else:
         bot.reply_to(message, "⚠️ No active broadcast process.")
 
 
-@bot.message_handler(func=lambda msg: msg.from_user.id == ADMIN_ID and broadcast_states.get(ADMIN_ID, False), content_types=["text", "photo", "video", "audio", "document", "animation", "voice"])
+@bot.message_handler(func=lambda msg: msg.from_user.id in ADMIN_IDS and broadcast_states.get(msg.from_user.id, False), content_types=["text", "photo", "video", "audio", "document", "animation", "voice"])
 def execute_broadcast(message):
     if message.text and message.text.startswith("/cancel"):
         return
 
-    broadcast_states.pop(ADMIN_ID, None)
-    users = get_all_users()
-    success = 0
-    failed = 0
-
-    status_msg = bot.reply_to(message, f"🚀 Broadcasting to {len(users)} users...")
-
-    for uid in users:
-        try:
-            bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.id)
-            success += 1
-            time.sleep(0.05)
-        except Exception:
-            failed += 1
-
-    try:
-        bot.edit_message_text(
-            f"✅ **Broadcast Finished!**\n\n• Success: {success}\n• Failed: {failed}",
-            chat_id=message.chat.id,
-            message_id=status_msg.id,
-            parse_mode="Markdown"
-        )
-    except Exception:
-        pass
-
-
-# ============ START COMMAND WITH STATS & REPLY KEYBOARD ============
-@bot.message_handler(commands=["start"])
-def send_welcome(message):
-    try:
-        user_id = message.from_user.id
-        first_name = message.from_user.first_name or "User"
-        add_user(user_id, first_name)
-
-        if user_id == ADMIN_ID:
-            logged_cnt, kw_cnt = get_blocklist_counts()
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-            broadcast_btn = types.KeyboardButton("📢 Broadcast")
-            markup.add(broadcast_btn)
-
-            text = (
-                f"👑 **Advanced Admin Control Panel**\n\n"
-                f"📊 **Current System Status:**\n"
-                f"• Locked/Logged Messages: `{logged_cnt}` (Auto-deletes exact spam messages)\n"
-                f"• Blocked Keywords/URLs: `{kw_cnt}` (Auto-deletes specific words/links)\n\n"
-                f"🛠️ **Commands & Features:**\n"
-    
+    admin_i
