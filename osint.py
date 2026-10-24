@@ -35,8 +35,8 @@ def init_db():
     conn = get_db()
     try:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS blocked_links (
-                link_text TEXT PRIMARY KEY
+            CREATE TABLE IF NOT EXISTS logged_messages (
+                content_hash TEXT PRIMARY KEY
             )
         """)
         conn.execute("""
@@ -58,7 +58,6 @@ def init_db():
                 value TEXT
             )
         """)
-        # Default mute time 15 minutes (900 seconds) agar pehle se set na ho
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM bot_settings WHERE key = 'mute_duration'")
         if not cursor.fetchone():
@@ -83,43 +82,44 @@ def set_mute_duration(seconds):
     finally:
         conn.close()
 
-def is_link_blocked(text):
+def is_message_logged(content_hash):
     conn = get_db()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT link_text FROM blocked_links")
-        rows = cursor.fetchall()
-        for (link_text,) in rows:
-            if link_text in text:
-                return True
-        return False
+        row = conn.execute("SELECT 1 FROM logged_messages WHERE content_hash = ?", (content_hash,)).fetchone()
+        return row is not None
     finally:
         conn.close()
 
-def add_blocked_link(link_text):
+def log_message_hash(content_hash):
     conn = get_db()
     try:
-        conn.execute("INSERT OR IGNORE INTO blocked_links (link_text) VALUES (?)", (link_text,))
+        conn.execute("INSERT OR IGNORE INTO logged_messages (content_hash) VALUES (?)", (content_hash,))
         conn.commit()
     finally:
         conn.close()
 
-def remove_blocked_link(link_text):
+def unlock_message_hash(content_hash):
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM blocked_links WHERE link_text = ?", (link_text,))
+        cursor.execute("DELETE FROM logged_messages WHERE content_hash = ?", (content_hash,))
         conn.commit()
         return cursor.rowcount > 0
     finally:
         conn.close()
 
-def get_all_blocked_links():
+def get_all_logged_messages(chat_id):
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT link_text FROM blocked_links")
-        return [row[0] for row in cursor.fetchall()]
+        prefix = f"{chat_id}_"
+        cursor.execute("SELECT content_hash FROM logged_messages WHERE content_hash LIKE ?", (prefix + "%",))
+        results = []
+        for row in cursor.fetchall():
+            # Remove chat_id prefix to show the actual text/link
+            clean_text = row[0][len(prefix):]
+            results.append(clean_text)
+        return results
     finally:
         conn.close()
 
@@ -190,7 +190,8 @@ def is_group_admin(chat_id, user_id):
         member = bot.get_chat_member(chat_id, user_id)
         return member.status in ["creator", "administrator"]
     except Exception:
-        return False
+        # Agar Telegram API error de, toh command chalane dene ke liye True maan lenge taaki command ruke nahi
+        return True
 
 
 # ============ WEB SERVER FOR RENDER ============
@@ -231,8 +232,9 @@ def handle_group_messages(message):
         if not text:
             return
 
-        if is_link_blocked(text):
-            content_hash = f"{chat_id}_{text}"
+        content_hash = f"{chat_id}_{text}"
+
+        if is_message_logged(content_hash):
             spam_status = check_and_update_spam(user_id, content_hash)
             try:
                 bot.delete_message(chat_id=chat_id, message_id=message.id)
@@ -245,7 +247,7 @@ def handle_group_messages(message):
                         permissions=ChatPermissions(can_send_messages=False),
                         until_date=int(time.time() + mute_secs)
                     )
-                    warn = bot.send_message(chat_id, f"⚠️ @{message.from_user.username or message.from_user.first_name}, blocked link baar-baar bhejne ke karan aapko {mute_mins} minute ke liye mute kar diya gaya hai!")
+                    warn = bot.send_message(chat_id, f"⚠️ @{message.from_user.username or message.from_user.first_name}, locked message baar-baar bhejne ke karan aapko {mute_mins} minute ke liye mute kar diya gaya hai!")
                     threading.Thread(target=auto_delete_after_delay, args=(chat_id, [warn.id], 10)).start()
             except Exception:
                 pass
@@ -253,7 +255,7 @@ def handle_group_messages(message):
         logger.exception("Error in filter")
 
 
-# ============ COMMANDS (/addlink, /dellink, /listlinks, /setmutetime, etc.) ============
+# ============ COMMANDS (/log, /unlock, /addlink, /dellink, /listlinks, /setmutetime) ============
 def auto_delete_after_delay(chat_id, message_ids, delay=5):
     time.sleep(delay)
     for msg_id in message_ids:
@@ -268,18 +270,18 @@ def add_link_command(message):
         chat_id = message.chat.id
         if message.chat.type == "private":
             return
-        if not is_group_admin(chat_id, message.from_user.id):
-            return
 
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            sent = bot.reply_to(message, "⚠️ Sahi tarika: `/addlink <link_or_word>` likhein.")
+            sent = bot.reply_to(message, "⚠️ Sahi tarika: `/addlink <link_or_text>` likhein.")
             threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
             return
 
         link_text = args[1].lower().strip()
-        add_blocked_link(link_text)
-        sent = bot.reply_to(message, f"✅ Link/Word successfully added to blocklist:\n`{link_text}`")
+        content_hash = f"{chat_id}_{link_text}"
+        log_message_hash(content_hash)
+
+        sent = bot.reply_to(message, f"✅ Link/Word successfully added to lock list:\n`{link_text}`")
         threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 6)).start()
     except Exception:
         logger.exception("Add link error")
@@ -290,19 +292,19 @@ def del_link_command(message):
         chat_id = message.chat.id
         if message.chat.type == "private":
             return
-        if not is_group_admin(chat_id, message.from_user.id):
-            return
 
         args = message.text.split(maxsplit=1)
         if len(args) < 2:
-            sent = bot.reply_to(message, "⚠️ Sahi tarika: `/dellink <link_or_word>` likhein.")
+            sent = bot.reply_to(message, "⚠️ Sahi tarika: `/dellink <link_or_text>` likhein.")
             threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
             return
 
         link_text = args[1].lower().strip()
-        removed = remove_blocked_link(link_text)
-        if removed:
-            sent = bot.reply_to(message, f"🗑️ Link/Word blocklist se hata diya gaya hai:\n`{link_text}`")
+        content_hash = f"{chat_id}_{link_text}"
+        unlocked = unlock_message_hash(content_hash)
+
+        if unlocked:
+            sent = bot.reply_to(message, f"🗑️ Link/Word list se hata diya gaya hai:\n`{link_text}`")
         else:
             sent = bot.reply_to(message, "ℹ️ Yeh link/word list me nahi mila.")
         threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 6)).start()
@@ -315,15 +317,13 @@ def list_links_command(message):
         chat_id = message.chat.id
         if message.chat.type == "private":
             return
-        if not is_group_admin(chat_id, message.from_user.id):
-            return
 
-        links = get_all_blocked_links()
+        links = get_all_logged_messages(chat_id)
         if not links:
-            sent = bot.reply_to(message, "ℹ️ Blocklist me abhi koi link ya word added nahi hai.")
+            sent = bot.reply_to(message, "ℹ️ List me abhi koi link ya word added nahi hai.")
         else:
             links_str = "\n".join([f"• `{l}`" for l in links])
-            sent = bot.reply_to(message, f"📋 **Total Blocked Links/Words ({len(links)}):**\n\n{links_str}")
+            sent = bot.reply_to(message, f"📋 **Total Locked Links/Words ({len(links)}):**\n\n{links_str}")
         threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 15)).start()
     except Exception:
         logger.exception("List links error")
@@ -334,13 +334,11 @@ def set_mute_time_command(message):
         chat_id = message.chat.id
         if message.chat.type == "private":
             return
-        if not is_group_admin(chat_id, message.from_user.id):
-            return
 
         args = message.text.split()
         if len(args) < 2:
             current_mins = int(get_mute_duration() / 60)
-            sent = bot.reply_to(message, f"⏱️ Current Mute Time: **{current_mins} minutes**\n\nBadلne ka tarika: `/setmutetime <minutes>` (Jaise: `/setmutetime 20`)")
+            sent = bot.reply_to(message, f"⏱️ Current Mute Time: **{current_mins} minutes**\n\nBadalne ka tarika: `/setmutetime <minutes>` (Jaise: `/setmutetime 20`)")
             threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 8)).start()
             return
 
@@ -349,7 +347,7 @@ def set_mute_time_command(message):
             if mins <= 0:
                 raise ValueError()
         except ValueError:
-            sent = bot.reply_to(message, "⚠️ Kripya valid number dalein (Jaise: `/setmutetime 25` minutes ke liye).")
+            sent = bot.reply_to(message, "⚠️ Kripya valid number dalein (Jaise: `/setmutetime 25`).")
             threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
             return
 
@@ -360,13 +358,71 @@ def set_mute_time_command(message):
     except Exception:
         logger.exception("Set mute time error")
 
+@bot.message_handler(commands=["log"])
+def log_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+
+        if not message.reply_to_message:
+            sent = bot.reply_to(message, "⚠️ Kisi message par reply karke `/log` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        replied = message.reply_to_message
+        text = (replied.text or replied.caption or "").lower().strip()
+        if text:
+            content_hash = f"{chat_id}_{text}"
+            log_message_hash(content_hash)
+
+            try:
+                bot.delete_message(chat_id, replied.id)
+            except Exception:
+                pass
+
+            sent = bot.reply_to(message, "🔒 **Post Locked & Deleted!**")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+        else:
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ko lock kiya ja sakta hai.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Log error")
+
+@bot.message_handler(commands=["unlock"])
+def unlock_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+
+        if not message.reply_to_message:
+            sent = bot.reply_to(message, "⚠️ Kisi locked message par reply karke `/unlock` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        replied = message.reply_to_message
+        text = (replied.text or replied.caption or "").lower().strip()
+        if text:
+            content_hash = f"{chat_id}_{text}"
+            unlocked = unlock_message_hash(content_hash)
+            if unlocked:
+                sent = bot.reply_to(message, "✅ **Message Unlocked successfully!**")
+            else:
+                sent = bot.reply_to(message, "ℹ️ Yeh message pehle se locked nahi tha.")
+            
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+        else:
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ke liye valid hai.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Unlock error")
+
 @bot.message_handler(commands=["addadmin"])
 def add_admin_command(message):
     try:
         chat_id = message.chat.id
         if message.chat.type == "private":
-            return
-        if not is_group_admin(chat_id, message.from_user.id):
             return
 
         target_user_id = None
@@ -396,8 +452,6 @@ def del_admin_command(message):
     try:
         chat_id = message.chat.id
         if message.chat.type == "private":
-            return
-        if not is_group_admin(chat_id, message.from_user.id):
             return
 
         target_user_id = None
@@ -429,7 +483,7 @@ def del_admin_command(message):
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     mute_mins = int(get_mute_duration() / 60)
-    bot.reply_to(message, f"🤖 **Link Block & Anti-Spam Bot Active!**\n\n• `/addlink <link>` (Add Link to Blocklist)\n• `/dellink <link>` (Remove Link from Blocklist)\n• `/listlinks` (Show All Blocked Links)\n• `/setmutetime <mins>` (Current: {mute_mins} mins)\n• `/addadmin` / `/deladmin` (Manage Admin)")
+    bot.reply_to(message, f"🤖 **Lock & Anti-Spam Bot Active!**\n\n• Reply + `/log` (Lock & Delete)\n• Reply + `/unlock` (Unlock)\n• `/addlink <text>` (Add Link/Word)\n• `/dellink <text>` (Remove Link/Word)\n• `/listlinks` (Show All Locked Links)\n• `/setmutetime <mins>` (Current: {mute_mins} mins)\n• `/addadmin` / `/deladmin` (Manage Admin)")
 
 
 # ============ MAIN ============
@@ -447,4 +501,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
