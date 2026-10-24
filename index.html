@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Download {{ app.app_name }}</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        .header {
+            width: 100%;
+            background: #ffffff;
+            padding: 15px;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }
+        .header h1 {
+            margin: 0;
+            color: #27ae60;
+            font-size: 24px;
+        }
+        .container {
+            max-width: 480px;
+            width: 100%;
+            background: #ffffff;
+            margin: 20px;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .app-icon {
+            width: 120px;
+            height: 120px;
+            border-radius: 24px;
+            object-fit: cover;
+            margin-bottom: 15px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+        }
+        .app-title {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 15px;
+        }
+        .info-badge {
+            display: inline-block;
+            background: #e8f8f5;
+            color: #27ae60;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            margin-bottom: 20px;
+        }
+        .download-btn {
+            display: block;
+            background: #27ae60;
+            color: white;
+            text-decoration: none;
+            padding: 15px;
+            border-radius: 30px;
+            font-size: 18px;
+            font-weight: bold;
+            box-shadow: 0 4px 12px rgba(39, 174, 96, 0.4);
+            transition: background 0.3s;
+        }
+        .download-btn:hover {
+            background: #219653;
+        }
+        .description {
+            text-align: left;
+            margin-top: 25px;
+            color: #555;
+            font-size: 14px;
+            line-height: 1.5;
+            border-top: 1px solid #eee;
+            padding-top: 15px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>OTT STORE</h1>
+    </div>
+
+    <div class="container">
+        <img src="{{ app.icon_url }}" alt="App Icon" class="app-icon">
+        <div class="app-title">{{ app.app_name }}</div>
+        
+        <div class="info-badge">
+            📦 Version: {{ app.version }} | 💾 Size: {{ app.file_size }}
+        </div>
+
+        <a href="{{ app.file_url }}" class="download-btn">
+            DOWNLOAD ({{ app.file_size }})
+        </a>
+
+        <div class="description">
+            <strong>About App:</strong><br>
+            {{ app.description }}
+        </div>
+    </div>
+
+</body>
+</html>
