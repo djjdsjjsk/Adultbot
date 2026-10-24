@@ -1,224 +1,424 @@
-import re
-import threading
+import os
 import time
-from flask import Flask
-from telebot import TeleBot, types
+import sqlite3
+import threading
+import logging
+import requests
+import telebot
 
-# --- Flask सर्वर (Render पर 24/7 एक्टिव रखने के लिए) ---
-app = Flask(__name__)
+from datetime import timedelta
+from telegram import ChatPermissions
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from requests.adapters import HTTPAdapter
+
+# ============ CONFIGURATION ============
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+APP_URL = os.environ.get("APP_URL", "https://adultbot-k29i.onrender.com").strip().rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+DB_PATH = os.environ.get("DB_PATH", "bot_data.db")
+
+if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
+    raise RuntimeError("BOT_TOKEN missing. Render Dashboard mein BOT_TOKEN set karein.")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("telegram-bot")
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=4)
 
 
-@app.route("/")
-def home():
-  return "Bot is active and running 24/7!"
+# ============ DATABASE HELPERS ============
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
-
-def run_flask():
-  # Render अपने हिसाब से PORT असाइन करता है, डिफ़ॉल्ट 5000 है
-  app.run(host="0.0.0.0", port=5000)
-
-
-# --- Keep-Alive पििंगर (हर 2-3 मिनट में खुद की लिंक दबाने के लिए) ---
-import urllib.request
-
-
-def keep_alive_ping():
-  url = "https://adultbot-k29i.onrender.com"
-  while True:
+def init_db():
+    conn = get_db()
     try:
-      urllib.request.urlopen(url)
-      print("Pinged successfully to keep alive!")
-    except Exception as e:
-      print(f"Ping failed: {e}")
-    # हर 2 मिनट (120 सेकंड) में पिंग करेगा
-    time.sleep(120)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logged_messages (
+                content_hash TEXT PRIMARY KEY
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_spam (
+                user_id INTEGER PRIMARY KEY,
+                last_msg_hash TEXT,
+                count INTEGER DEFAULT 1,
+                mute_until REAL DEFAULT 0
+            )
+        """)
+        # Dynamic Admins Database Table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
 
-
-# --- Telegram Bot Setup ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"
-bot = TeleBot(TOKEN)
-
-# 1. URL Whitelist (यहाँ अपने भरोसेमंद लिंक्स/डोमेन जोड़ें जो बैन नहीं होंगे)
-WHITELISTED_URLS = [
-    "youtube.com",
-    "t.me/your_channel_username",  # आपके चैनल का यूजरनेम यहाँ डालें
-    "example.com",
-    "adultbot-k29i.onrender.com",  # आपकी खुद की होस्टिंग लिंक भी जोड़ दी गई है
-]
-
-# यूजर्स की वार्निंग्स ट्रैक करने के लिए डिक्शनरी
-user_warnings = {}
-
-
-# फंक्शन: चेक करना कि मैसेज में कोई unlisted लिंक है या नहीं
-def contains_unlisted_url(text):
-  if not text:
-    return False
-
-  # URL पकड़ने का रेगुलर एक्सप्रेसिन
-  url_pattern = r"(https?://\S+|www\.\S+|t\.me/\S+)"
-  urls = re.findall(url_pattern, text)
-  if not urls:
-    return False
-
-  for url in urls:
-    is_whitelisted = False
-    for w in WHITELISTED_URLS:
-      if w.lower() in url.lower():
-        is_whitelisted = True
-        break
-    # अगर कोई ऐसा URL मिला जो whitelist में नहीं है
-    if not is_whitelisted:
-      return True
-
-  return False
-
-
-# 1. /start और /help कमांड: एडमिन के लिए सभी कमांड्स की लिस्ट दिखाना
-@bot.message_handler(commands=['start', 'help'])
-def show_help(message):
-  try:
-    chat_member = bot.get_chat_member(message.chat.id, message.from_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-      bot.reply_to(
-          message, '❌ यह कमांड लिस्ट सिर्फ ग्रुप एडमिन के लिए उपलब्ध है।'
-      )
-      return
-  except Exception:
-    return
-
-  help_text = (
-      '🤖 **ग्रुप मॉडेशन बोट - एडमिन कमांड्स गाइड**\n\n'
-      'नीचे बोट के सभी उपलब्ध कमांड्स और उनके काम दिए गए हैं:\n\n'
-      '🔹 `/help` या `/start`\n'
-      '   👉 बोट के सभी कमांड्स की यह लिस्ट देखने के लिए।\n\n'
-      '🔹 `/unrestrict <User_ID>` (या `/unmute`) \n'
-      '   👉 किसी म्यूट किए गए यूजर की आईडी डालकर उसका रिस्ट्रिक्शन तुरंत'
-      ' हटाने के लिए।\n\n'
-      '📌 **एंटी-लिंक सिस्टम नियम:**\n'
-      '• बिना अनुमति (Whitelist) वाले लिंक भेजने पर पहली और दूसरी बार मैसेज'
-      ' डिलीट कर वार्निंग दी जाएगी।\n'
-      '• तीसरी बार लिंक भेजने पर यूजर ऑटोमैटिकली **15 मिनट** के लिए म्यूट'
-      ' (Restrict) हो जाएगा।'
-  )
-
-  bot.reply_to(message, help_text, parse_mode='Markdown')
-
-
-# 2. /unrestrict कमांड: यूजर को अनम्यूट करने के लिए
-@bot.message_handler(commands=['unrestrict', 'unmute'])
-def unrestrict_user(message):
-  try:
-    chat_member = bot.get_chat_member(message.chat.id, message.from_user.id)
-    if chat_member.status not in ['administrator', 'creator']:
-      bot.reply_to(message, '❌ यह कमांड सिर्फ ग्रुप एडमिन के लिए है!')
-      return
-  except Exception:
-    return
-
-  args = message.text.split()
-
-  if len(args) < 2:
-    bot.reply_to(
-        message,
-        '⚠️ **इस्तेमाल करने का तरीका गलत है!**\n\nसही तरीका:\n`/unrestrict'
-        ' <User_ID>`\nउदाहरण: `/unrestrict 8774983792`',
-        parse_mode='Markdown',
-    )
-    return
-
-  try:
-    target_user_id = int(args[1])
-    bot.restrict_chat_member(
-        message.chat.id,
-        target_user_id,
-        can_send_messages=True,
-        can_send_media_messages=True,
-        can_send_other_messages=True,
-        can_add_web_page_previews=True,
-    )
-
-    if target_user_id in user_warnings:
-      user_warnings[target_user_id] = 0
-
-    bot.reply_to(
-        message,
-        f'✅ सफलता! यूजर (ID: `{target_user_id}`) का रिस्ट्रिक्शन हटा दिया'
-        ' गया है।',
-        parse_mode='Markdown',
-    )
-  except Exception as e:
-    bot.reply_to(
-        message,
-        f'❌ अनरिस्ट्रिक्ट करने में एरर आया: {e}\n(सुनिश्चित करें कि बोट एडमिन'
-        ' है और आईडी सही है)',
-    )
-
-
-# 3. सामान्य मैसेज मॉनिटर: लिंक चेक करने और 3 स्ट्राइक्स पर म्यूट करने के लिए
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def monitor_links(message):
-  if message.from_user:
+def is_message_logged(content_hash):
+    conn = get_db()
     try:
-      member = bot.get_chat_member(message.chat.id, message.from_user.id)
-      if member.status in ['administrator', 'creator']:
-        return
-    except:
-      pass
+        row = conn.execute("SELECT 1 FROM logged_messages WHERE content_hash = ?", (content_hash,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
-  if message.text and contains_unlisted_url(message.text):
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name
-
+def log_message_hash(content_hash):
+    conn = get_db()
     try:
-      bot.delete_message(message.chat.id, message.message_id)
-    except:
-      pass
+        conn.execute("INSERT OR IGNORE INTO logged_messages (content_hash) VALUES (?)", (content_hash,))
+        conn.commit()
+    finally:
+        conn.close()
 
-    user_warnings[user_id] = user_warnings.get(user_id, 0) + 1
-    warnings = user_warnings[user_id]
+def unlock_message_hash(content_hash):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM logged_messages WHERE content_hash = ?", (content_hash,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
 
-    if warnings < 3:
-      bot.send_message(
-          message.chat.id,
-          f'⚠️ **{user_name}**, इस ग्रुप में बिना अनुमति के लिंक भेजना मना'
-          f' है!\nचेतावनी ({warnings}/3): आपका मैसेज डिलीट कर दिया गया है। 3'
-          ' बार ऐसा करने पर 15 मिनट के लिए म्यूट कर दिए जाओगे।',
-          parse_mode='Markdown',
-      )
-    else:
-      until_time = int(time.time()) + 900
-      try:
+def check_and_update_spam(user_id, content_hash):
+    conn = get_db()
+    now = time.time()
+    try:
+        row = conn.execute("SELECT last_msg_hash, count, mute_until FROM user_spam WHERE user_id = ?", (user_id,)).fetchone()
+        if row:
+            last_hash, count, mute_until = row
+            if now < mute_until:
+                return "muted"
+
+            if last_hash == content_hash:
+                count += 1
+            else:
+                count = 1
+                last_hash = content_hash
+
+            if count >= 3:
+                mute_until = now + 900  # 15 minutes
+                conn.execute("UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = ? WHERE user_id = ?", (last_hash, count, mute_until, user_id))
+                conn.commit()
+                return "just_muted"
+            else:
+                conn.execute("UPDATE user_spam SET last_msg_hash = ?, count = ?, mute_until = 0 WHERE user_id = ?", (last_hash, count, user_id))
+                conn.commit()
+                return "active"
+        else:
+            conn.execute("INSERT INTO user_spam (user_id, last_msg_hash, count, mute_until) VALUES (?, ?, 1, 0)", (user_id, content_hash))
+            conn.commit()
+            return "active"
+    finally:
+        conn.close()
+
+# ============ DYNAMIC ADMIN MANAGEMENT ============
+def add_bot_admin(user_id):
+    conn = get_db()
+    try:
+        conn.execute("INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def remove_bot_admin(user_id):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM bot_admins WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+def is_bot_admin(user_id):
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT 1 FROM bot_admins WHERE user_id = ?", (user_id,)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+def is_group_admin(chat_id, user_id):
+    if is_bot_admin(user_id):
+        return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status in ["creator", "administrator"]
+    except Exception:
+        return False
+
+
+# ============ WEB SERVER FOR RENDER ============
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, fmt, *args):
+        pass
+
+def start_health_server():
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+def start_self_ping():
+    def worker():
+        while True:
+            try:
+                requests.get(APP_URL + "/", timeout=15)
+            except Exception:
+                pass
+            time.sleep(180) # Har 3 minute me khud ki link ko hit karega
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ============ MESSAGE FILTER & SPAM MUTE HANDLER ============
+@bot.message_handler(func=lambda message: message.chat.type in ["group", "supergroup"] and (not message.text or not message.text.startswith("/")))
+def handle_group_messages(message):
+    try:
+        chat_id = message.chat.id
+        user_id = message.from_user.id if message.from_user else None
+
+        if user_id and is_group_admin(chat_id, user_id):
+            return
+
+        text = (message.text or message.caption or "").lower().strip()
+        content_hash = f"{chat_id}_{text}"
+
+        if is_message_logged(content_hash):
+            spam_status = check_and_update_spam(user_id, content_hash)
+            try:
+                bot.delete_message(chat_id=chat_id, message_id=message.id)
+                if spam_status == "just_muted":
+                    bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=int(time.time() + 900)
+                    )
+                    warn = bot.send_message(chat_id, f"⚠️ @{message.from_user.username or message.from_user.first_name}, locked message baar-baar bhejne ke karan aapko 15 minute ke liye mute kar diya gaya hai!")
+                    threading.Thread(target=auto_delete_after_delay, args=(chat_id, [warn.id], 10)).start()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Error in filter")
+
+
+# ============ COMMANDS (/log, /unlock, /addadmin, /deladmin, /unrestrict) ============
+def auto_delete_after_delay(chat_id, message_ids, delay=5):
+    time.sleep(delay)
+    for msg_id in message_ids:
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+
+@bot.message_handler(commands=["unrestrict"])
+def unrestrict_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+        if not is_group_admin(chat_id, message.from_user.id):
+            return
+
+        args = message.text.split()
+        target_user_id = None
+        
+        if len(args) > 1:
+            try:
+                target_user_id = int(args[1])
+            except ValueError:
+                pass
+
+        if not target_user_id:
+            sent = bot.reply_to(message, "⚠️ Sahi tarika: `/unrestrict <user_id>` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        # User ka mute hatane ke liye permissions restore karein
         bot.restrict_chat_member(
-            message.chat.id,
-            user_id,
-            until_date=until_time,
-            can_send_messages=False,
+            chat_id=chat_id,
+            user_id=target_user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_invite_users=True
+            ),
+            until_date=int(time.time() + 1)
         )
-        bot.send_message(
-            message.chat.id,
-            f'🚫 **{user_name}** (ID: `{user_id}`) को 3 बार अनधिकृत लिंक भेजने के'
-            ' कारण **15 मिनट** के लिए म्यूट कर दिया गया है!',
-            parse_mode='Markdown',
-        )
-        user_warnings[user_id] = 0
-      except Exception as e:
-        print(f'Restriction error: {e}')
+        
+        # Spam count/mute status bhi database se reset kar dein
+        conn = get_db()
+        try:
+            conn.execute("UPDATE user_spam SET mute_until = 0, count = 0 WHERE user_id = ?", (target_user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+        sent = bot.reply_to(message, f"✅ User ID `{target_user_id}` ka restriction hata diya gaya hai, ab woh message bhej sakta hai!")
+        threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 6)).start()
+    except Exception:
+        logger.exception("Unrestrict error")
+        sent = bot.reply_to(message, "❌ Unrestrict karne me error aaya. Kripya check karein ki bot group me admin hai.")
+        threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+
+@bot.message_handler(commands=["addadmin"])
+def add_admin_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+        if not is_group_admin(chat_id, message.from_user.id):
+            return
+
+        target_user_id = None
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user_id = message.reply_to_message.from_user.id
+        else:
+            args = message.text.split()
+            if len(args) > 1:
+                try:
+                    target_user_id = int(args[1])
+                except ValueError:
+                    pass
+
+        if not target_user_id:
+            sent = bot.reply_to(message, "⚠️ Kisi user ke message par reply karein ya `/addadmin <user_id>` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        add_bot_admin(target_user_id)
+        sent = bot.reply_to(message, f"✅ User ID `{target_user_id}` ko successfully bot admin/protected bana diya gaya hai!")
+        threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Add admin error")
+
+@bot.message_handler(commands=["deladmin"])
+def del_admin_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+        if not is_group_admin(chat_id, message.from_user.id):
+            return
+
+        target_user_id = None
+        if message.reply_to_message and message.reply_to_message.from_user:
+            target_user_id = message.reply_to_message.from_user.id
+        else:
+            args = message.text.split()
+            if len(args) > 1:
+                try:
+                    target_user_id = int(args[1])
+                except ValueError:
+                    pass
+
+        if not target_user_id:
+            sent = bot.reply_to(message, "⚠️ Kisi user ke message par reply karein ya `/deladmin <user_id>` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        removed = remove_bot_admin(target_user_id)
+        if removed:
+            sent = bot.reply_to(message, f"🗑️ User ID `{target_user_id}` ko admin list se hata diya gaya hai.")
+        else:
+            sent = bot.reply_to(message, "ℹ️ Yeh user list me nahi mila.")
+        threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Del admin error")
+
+@bot.message_handler(commands=["log"])
+def log_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+        if not is_group_admin(chat_id, message.from_user.id):
+            return
+
+        if not message.reply_to_message:
+            sent = bot.reply_to(message, "⚠️ Kisi message par reply karke `/log` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        replied = message.reply_to_message
+        text = (replied.text or replied.caption or "").lower().strip()
+        if text:
+            content_hash = f"{chat_id}_{text}"
+            log_message_hash(content_hash)
+
+            try:
+                bot.delete_message(chat_id, replied.id)
+            except Exception:
+                pass
+
+            sent = bot.reply_to(message, "🔒 **Post Locked & Deleted!**")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+        else:
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ko lock kiya ja sakta hai.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Log error")
+
+@bot.message_handler(commands=["unlock"])
+def unlock_command(message):
+    try:
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            return
+        if not is_group_admin(chat_id, message.from_user.id):
+            return
+
+        if not message.reply_to_message:
+            sent = bot.reply_to(message, "⚠️ Kisi locked message par reply karke `/unlock` likhein.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+            return
+
+        replied = message.reply_to_message
+        text = (replied.text or replied.caption or "").lower().strip()
+        if text:
+            content_hash = f"{chat_id}_{text}"
+            unlocked = unlock_message_hash(content_hash)
+            if unlocked:
+                sent = bot.reply_to(message, "✅ **Message Unlocked successfully!**")
+            else:
+                sent = bot.reply_to(message, "ℹ️ Yeh message pehle se locked nahi tha.")
+            
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+        else:
+            sent = bot.reply_to(message, "⚠️ Sirf text messages ke liye valid hai.")
+            threading.Thread(target=auto_delete_after_delay, args=(chat_id, [message.id, sent.id], 5)).start()
+    except Exception:
+        logger.exception("Unlock error")
 
 
-# --- मुख्य प्रोग्राम एग्जीक्यूशन ---
-if __name__ == "__main__":
-  # 1. Flask सर्वर को बैकग्राउंड धागे (Thread) में चलाना
-  t_flask = threading.Thread(target=run_flask)
-  t_flask.daemon = True
-  t_flask.start()
+@bot.message_handler(commands=["start"])
+def start_cmd(message):
+    bot.reply_to(message, "🤖 **Lock & Anti-Spam Bot Active!**\n\n• Reply + `/log` (Lock & Delete)\n• Reply + `/unlock` (Unlock)\n• `/unrestrict <user_id>` (Unmute User)\n• `/addadmin` / `/deladmin` (Manage Admin)")
 
-  # 2. Keep-Alive पिंगर को बैकग्राउंड में चलाना (हर 2 मिनट में लिंक को हिट करेगा)
-  t_ping = threading.Thread(target=keep_alive_ping)
-  t_ping.daemon = True
-  t_ping.start()
 
-  # 3. बोट पोलिंग शुरू करना
-  print("Bot and Keep-Alive server are running...")
-  bot.infinity_polling()
+# ============ MAIN ============
+def main():
+    init_db()
+    threading.Thread(target=start_health_server, daemon=True).start()
+    start_self_ping()
+    logger.info("Bot polling started...")
     
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=25)
+        except Exception:
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
+      
